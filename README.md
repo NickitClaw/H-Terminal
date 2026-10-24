@@ -1,96 +1,127 @@
 # H-Terminal 方案设计
 
-H-Terminal 是一款专门适配 Huawei Pura X Max 折叠屏、HarmonyOS 7 的终端/命令行 App，支持通过 SSH 连接远端 Linux/Unix 服务器。其核心交互是在内屏约 90° 展开时提供类似笔记本电脑的体验：上方显示终端，下方显示桌面式全功能键盘。
+H-Terminal 是一款专门适配 Huawei Pura X Max 折叠屏、HarmonyOS 7 的 SSH 终端 App。核心交互是在内屏约 90° 展开时，上方显示终端，下方提供适合命令行操作的桌面式键盘。
 
-## 1. 总体结论
+**文档状态：方案设计，尚无实现及真机验证结果。** 更新日期：2026-10-24。文中的角度、尺寸、队列和性能数值均为待验证的初始值或验收目标，不代表已达到的能力。
 
-该方案可行，不需要从零编写终端仿真器，也不建议直接照搬 Termux。推荐首版采用：
+## 1. 产品目标与首版范围
 
-> **HarmonyOS 7 / API 26 + ArkUI 原生外壳 + xterm.js 终端 + Native C++ SSH + 自定义下屏全功能键盘。**
+### 1.1 目标用户与核心任务
 
-终端区域首版可以使用 ArkWeb，因此不是“纯无 WebView 原生”。如果坚持纯原生，可评估较新的 `libghostty-ohos`，但需要预留更多真机验证和缺陷修复时间。
+首版面向已有 Linux/Unix 服务器使用经验、需要在没有电脑或外接键盘时进行短时远程操作的开发者和运维人员。目标是完成应急运维、日志查看和轻量编辑；不承诺替代实体键盘进行长时间编码。
 
-本文基于官方文档和社区源码调研，尚未在 Pura X Max 真机上验证。
-
-## 2. 平台能力与社区方案
-
-[Pura X Max 官方规格](https://consumer.huawei.com/cn/phones/pura-x-max/specs/)确认其内屏为 7.7 英寸、2584×1828，运行 HarmonyOS 7；[HarmonyOS 7 开发者公告](https://developer.huawei.com/consumer/cn/notice/detail/?id=9002210958618976001)明确其目标 SDK 为 **API 26**。华为的 [Pura X Max 适配指南](https://developer.huawei.com/consumer/cn/doc/doccenter-multi-device/bpta-purax-guide)也明确包含悬停态。
-
-因此，专供这款设备时可以直接以 API 26 为基线，不必为首版增加旧系统兼容负担。
-
-### 2.1 当前主要技术路线
-
-鸿蒙终端目前还没有像 Termux 那样的单一事实标准，更准确地说是以下几类方案：
-
-| 路线 | 代表项目 | 适用判断 |
+| 核心任务 | 代表操作 | 体验目标 |
 | --- | --- | --- |
-| ArkWeb + 设备内 Node.js | [electerm-harmony](https://github.com/electerm/electerm-harmony) | 已有完整 SSH/SFTP 等产品能力，适合快速功能验证；但 Node 运行时较重，还要维护本地服务和运行时的安全边界 |
-| ArkWeb/xterm.js + Native SSH | [CrossShellNext](https://gitcode.com/OpenHarmonyPCDeveloper/CrossShellNext) 等 | 终端兼容性、开发量和包体之间最平衡，推荐作为本产品首版路线 |
-| 原生 VT + 原生渲染 | [libghostty-ohos](https://github.com/wiedymi/libghostty-ohos) | 已提供 `TerminalSurface`、XComponent、IME、选择和滚动区；但不提供 SSH，且目前仍属早期的 0.1.x 项目 |
-| 本地 Shell/Linux 兼容环境 | [Termony](https://github.com/TermonyHQ/Termony)、Harmonix、HiSH | 主要解决本地命令、HNP、QEMU 或 Linux 环境，不是现成 SSH SDK；首版做 SSH 不必引入这些复杂度 |
-| 商业原生产品 | [TermNext](https://termnext.com/en/) | SSH、Mosh、SFTP、MFA、跳板机和转发可作为功能标杆；本次调研未找到可复用的开源实现 |
+| 查看日志与定位问题 | 输入长路径、管道和引号，搜索输出，Ctrl+C 停止 | 常用符号和控制键容易触达，大输出时仍能操作 |
+| 修改配置 | 在 vim 中移动、搜索、修改、保存和退出 | Esc、方向键、Ctrl/Alt 组合准确，字号可读 |
+| 操作远端工作区 | 切换 tmux 窗口、查看 htop、断线后重新 attach | 姿态切换保持连接，断线恢复行为明确 |
 
-### 2.2 可借鉴的终端交互
+“完整键盘”指特殊键和组合键能力完整，不等于所有按键必须同时常驻。六行完整布局与紧凑布局由真机任务测试决定默认值。
 
-- [Termux 的 Extra Keys](https://github.com/termux/termux-app/blob/master/termux-shared/src/main/java/com/termux/shared/termux/settings/properties/TermuxPropertyConstants.java)：可配置按键、宏、弹出键。
-- [Termius 扩展键盘](https://docs.termius.com/terminal/mobile-terminal)：功能键、导航键、自定义键组、片段“插入/运行”分离、外接硬件键盘模式。
-- [Windows Terminal 的交互保护](https://learn.microsoft.com/en-us/windows/terminal/customize-settings/interaction)：多行/大段粘贴警告、应用快捷键与终端输入分层。
+### 1.2 范围与优先级
 
-但在 90° 姿态下不应继续使用“26 键系统键盘＋两行快捷键”，下屏应直接升级为桌面式键盘。
+| 阶段 | 能力 | 边界 |
+| --- | --- | --- |
+| MVP 必需 | 主机管理；密码、公钥、keyboard-interactive；主机密钥校验；凭据接入与安全存储 | 私钥导入至少支持 OpenSSH Ed25519 的明文与口令加密格式；其他格式逐项声明 |
+| MVP 必需 | 多会话标签、90°布局、紧凑回退、核心特殊键、基本物理键盘输入、复制粘贴、滚动区、resize | 初始最多 4 个活动会话；不含分屏终端和触控板模式 |
+| MVP 必需 | 系统中文输入、连接状态、手动重连、tmux 使用引导 | 中文模式允许布局调整；不承诺系统 IME 固定在下屏 |
+| 接入条件决定 | 单跳跳板机；目标服务器要求的认证组合或密钥格式 | 原型阶段盘点真实接入路径，若必需则纳入 MVP，不以无法接入目标机器的版本试用 |
+| 后续完善 | SFTP、自定义键位和片段、触控板、本地转发、应用内拼音输入 | 片段插入与执行分离；文件、转发能力另行设计权限和生命周期 |
+| 按需评估 | Mosh、原生终端渲染、远程/动态转发、本地 Shell | 不进入首版，不同时维护两套终端后端 |
 
-## 3. 推荐总体架构
+首版直接访问可达的 SSH 服务器；已有系统 VPN 可作为网络环境，不在应用内实现 VPN。若首批用户需要跳板机，按第 8.4 节实现，不把登录跳板机后手工再运行 ssh 等同于客户端原生跳转。
+
+## 2. 技术路线与依据
+
+推荐原型和首版采用：
+
+> **HarmonyOS 7 / API 26 + ArkUI 原生外壳 + xterm.js @ ArkWeb + Native C++ SSH + 自定义下屏键盘。**
+
+[Pura X Max 官方规格](https://consumer.huawei.com/cn/phones/pura-x-max/specs/)列出内屏 7.7 英寸、2584×1828、HarmonyOS 7；[HarmonyOS 7 开发者活动](https://developer.huawei.com/consumer/cn/activity/developerbeta/harmonyos-developer-beta-7-1)明确 API 26；[机型适配指南](https://developer.huawei.com/consumer/cn/newdevice/pura-x-max/)覆盖折叠、展开和悬停形态。专供该设备时以 API 26 为基线，实际 SDK、系统构建号和 ArkWeb 版本随验证记录固定，不因设备分辨率直接推算可用 vp 尺寸。
+
+### 2.1 社区方案参考
+
+| 路线 | 代表项目 | 本项目取舍 |
+| --- | --- | --- |
+| ArkWeb + 设备内 Node.js | [electerm-harmony](https://github.com/electerm/electerm-harmony) | 可参考产品流程；首版不为 SSH 引入完整 Node.js 运行时和本地服务 |
+| ArkWeb/xterm.js + Native SSH | [CrossShellNext](https://gitcode.com/OpenHarmonyPCDeveloper/CrossShellNext) | 作为集成参考，依赖版本、安全状态和具体能力独立核实 |
+| 原生 VT 与渲染 | [libghostty-ohos](https://github.com/wiedymi/libghostty-ohos) | 项目提供 TerminalSurface、控制器与原生渲染，不提供 SSH；仅在 ArkWeb 原型不达标时评估 |
+| 本地 Shell/Linux 环境 | [Termony](https://github.com/TermonyHQ/Termony) 等 | 解决的问题不同，不引入首版 |
+| 商业产品 | [TermNext](https://termnext.com/en/) | 用作 SSH、Mosh、SFTP 等功能参考，不假定存在可复用实现 |
+
+交互参考：[Termux Extra Keys](https://github.com/termux/termux-app/blob/master/termux-shared/src/main/java/com/termux/shared/termux/settings/properties/TermuxPropertyConstants.java)、[Termius 移动终端](https://docs.termius.com/terminal/mobile-terminal)、[Windows Terminal 粘贴与快捷键保护](https://learn.microsoft.com/en-us/windows/terminal/customize-settings/interaction)。社区实现是调研依据，不是本产品已经具备对应能力的证明。
+
+## 3. 架构与状态归属
 
 ```text
-┌──────────────────── ArkUI / ArkTS ────────────────────┐
-│ 主机管理   会话标签   设置   SFTP 页面                 │
-│                                                       │
-│ PostureEngine       TerminalContainer                 │
-│ 折叠/角度/折痕  →   xterm.js @ ArkWeb                 │
-│                     ↑ 可替换为 libghostty-ohos         │
-│ LaptopKeyboard → InputRouter → 终端键盘编码            │
-└──────────────────────┬────────────────────────────────┘
-                       │ N-API：批量字节流、状态事件、resize
-┌──────────────────────▼────────────────────────────────┐
-│ Native SessionManager                                 │
-│ SSH Session / Channel / SFTP / Forwarding             │
-│ HostKey 校验 / 重连 / 有界队列 / 背压                  │
-│ libssh2 安全审计构建，或 libssh 备选                   │
-└──────────────────────┬────────────────────────────────┘
-                       │
-                HUKS / ASSET / 沙箱
+ArkUI：主机管理 / 会话标签 / 设置 / 原生认证与信任确认
+  PostureEngine → LayoutCoordinator → TerminalContainer
+  触屏键盘 / 物理键盘 / IME → InputRouter
+                                 ↓
+应用级 TerminalRuntime：每会话一个 TerminalBackend
+  xterm.js @ 常驻 ArkWeb：终端模式、输入编码、解析、滚动区
+  输入字节 ↓                    ↑ 输出字节 / 解析完成 ACK
+               受控 ArkWeb 桥接 / ArkTS / N-API
+                                 ↓
+Native SessionManager：每活动会话独立 SSH transport / PTY channel
+  非阻塞网络循环 / HostKey / 认证 / 有界队列 / 重连策略
+                                 ↓
+CredentialService：HUKS 签名 / ASSET / 应用沙箱
 ```
 
-### 3.1 关键设计原则
+### 3.1 组件职责
 
-- **不要自己实现 VT 解析器**。[xterm.js](https://github.com/xtermjs/xterm.js)已经覆盖 curses、vim、tmux、鼠标、Unicode、IME 等大量终端边界情况。
-- SSH 放在 Native 层，避免为了 SSH 引入完整 Node.js 运行时。
-- `SessionManager` 不依赖 ArkUI 页面生命周期。开合屏幕只改变布局，不能重建 SSH 会话。
-- Native 到 ArkWeb 使用受控桥接，按块传递数据并设置有界队列、背压；不要逐字节调用 `runJavaScript`，也不要把远端输出拼接成 JS 源码。
-- 定义统一的 `TerminalBackend` 接口，后续只有实测证明 ArkWeb 性能或 IME 不达标时，才替换为原生 Ghostty。
-- SSH 库若选 libssh2，应使用固定、经过安全补丁审计的构建，不能直接复制社区示例附带的旧库。其[公钥签名回调](https://libssh2.org/libssh2_userauth_publickey.html)便于接 HUKS。
-- 如果团队没有能力维护 libssh2 安全分支，建议改用已有安全正式版的 [libssh 0.12.2+](https://www.libssh.org/2026/07/28/libssh-0-12-2-security-release/)，同时完成 HUKS 签名适配和 LGPL 合规评审。
+| 组件 | 持有的状态 | 生命周期与约束 |
+| --- | --- | --- |
+| HostRepository | 地址、端口、用户名、凭据引用、信任记录、主机选项 | 持久化；配置中不保存明文秘密 |
+| SessionManager | 连接状态、连接代次、SSH/PTY 资源、网络队列 | 应用级 Native 对象，不随页面或姿态创建销毁 |
+| TerminalRuntime | 每会话的 xterm 实例、终端模式、屏幕与有界滚动区 | 标签切换仅改变可见性；关闭标签才释放实例 |
+| InputRouter | 当前输入目标、输入模式、修饰键、组字事务 | 事件绑定会话和连接代次；切换目标必须清理临时状态 |
+| LayoutCoordinator | 窗口、折痕、安全区、字号、最终行列 | 只改变布局和 PTY 尺寸，不触发连接或认证 |
+| CredentialService | 密钥别名、签名和凭据解锁请求 | 不暴露私钥给 ArkWeb；认证取消后清理临时秘密 |
 
-## 4. 90°“类笔记本”布局
+MVP 每个标签使用独立 SSH 连接，降低多通道调度和背压互相影响的复杂度。常驻 ArkWeb 内为每个活动会话保留一个 xterm 实例；不可见会话继续解析输出，但不主动执行 fit，也不发送零尺寸 resize。
 
-### 4.1 姿态识别
+“常驻”是应用内组件管理策略，不是系统保活承诺。页面路由与姿态切换不主动销毁 ArkWeb；进程或渲染器异常按第 8.5 节处理。
 
-使用官方 [display API](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-References/js-apis-display) 和[悬停态适配指南](https://developer.huawei.com/consumer/cn/doc/best-practices/bpta-folded-hover)，组合判断：
+### 3.2 终端与 SSH 后端
 
-- `FOLD_STATUS_HALF_FOLDED`：只表示半折，不等于恰好 90°。
-- `foldAngleChange`：角度范围 0～180°，用于识别约 90° 区间。
-- `getLiveCreaseRegion()` 或当前折痕接口：确认折痕确实将应用窗口分成上下区域。
-- `foldDisplayModeChange`、`windowRectChange`：确认当前使用内屏，并等待窗口尺寸稳定。
-- 分屏、悬浮窗、外屏或折痕不与窗口相交时，退回普通布局。
+- 不自写 VT 解析器。首版只实现 XtermBackend；接口覆盖 feed、sendKey、commitText、paste、resize、selection 和 dispose，不承诺不同渲染后端之间运行中迁移状态。
+- SSH 在 Native 工作线程使用非阻塞模式运行，网络循环不得等待 UI 绘制或用户确认。签名、主机信任和认证提示通过可取消的请求返回结果。
+- libssh2 可利用[公钥签名回调](https://libssh2.org/libssh2_userauth_publickey.html)接入 HUKS，但仍需验证签名算法、公钥 wire format、线程模型和取消行为。
+- SSH 库在原型阶段定版。选择 libssh2 时固定经安全补丁核对的 tag/commit；若维护成本不可接受，评估 libssh 及其外部签名适配和 LGPL 交付要求。[libssh 安全发布记录](https://www.libssh.org/2026/07/28/libssh-0-12-2-security-release/)仅为参考，不把某个历史版本永久视为安全下限。
+- 记录 SSH 库、加密依赖、xterm.js 及 addon 的版本、补丁与许可证；每次发布重新核对上游安全公告，并指定依赖更新负责人。
 
-可以从“75°～105°进入，小于 65°或大于 120°退出，稳定约 200ms 后再布局”作为初始参数，加入迟滞避免反复跳动；这些数值必须通过真机校准，同时提供手动切换按钮。
+## 4. 姿态识别与终端布局
 
-建议使用**自定义 ArkUI 布局**，而不是强依赖 `FolderStack` 或 `FoldSplitContainer`，因为本产品还需要手动模式、紧凑键盘、外接键盘和多窗口回退。
+### 4.1 进入和退出条件
 
-布局时让终端组件始终保留在同一个组件节点，只调整位置和尺寸。尺寸稳定后再计算终端行列，并发送 SSH `window-change`，避免连续触发远端 TUI 重绘。
+使用官方 [display API](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-References/js-apis-display) 和[悬停态指南](https://developer.huawei.com/consumer/cn/doc/best-practices/bpta-folded-hover)，组合判断：
 
-### 4.2 下屏键盘
+- FOLD_STATUS_HALF_FOLDED 只表示半折；foldAngleChange 提供折叠角度，不能单凭其中一个判定类笔记本模式。
+- 根据当前 Display 的 getLiveCreaseRegion() 获取折痕；也可评估 getCurrentFoldCreaseRegion()。具体接口、坐标含义和设备支持以目标 SDK 与真机为准。
+- 监听 foldDisplayModeChange、窗口尺寸和旋转变化，确认内屏生效、窗口稳定，折痕在应用可用区域内横向分隔出两个有效矩形。
+- 竖向折痕、外屏、分屏、悬浮窗、折痕不相交或上下区域不足时，自动模式回退普通布局。不能用折叠状态代替当前显示屏与窗口判断。
 
-建议采用 **75% 风格、六行紧凑全功能键盘**：
+自动状态为普通布局、待稳定、类笔记本布局。初始以 75°～105°进入，小于 65°或大于 120°退出；进入条件持续满足且窗口几何稳定约 200ms 后应用布局。区间内角度小幅变化不重新计时，连续窗口事件合并；进入条件失效立即取消待应用结果。已进入后按退出阈值判断，避免在进入阈值附近反复切换。
+
+提供“自动 / 手动上下布局 / 普通布局”选择。手动上下布局优先沿有效横向折痕分区；没有有效折痕时仅为窗口内上下布局，不宣称与物理上下屏对应。任何模式都遵守最小可用尺寸，空间不足时提示并回退。
+
+### 4.2 坐标与 resize
+
+1. 获取同一布局代次的 displayId、旋转、显示坐标、窗口位置、密度和安全区。将折痕从其 API 定义的坐标系转换为窗口局部坐标，统一 px/vp 后再求交，避免重复旋转或重复换算。
+2. 为折痕留出不可点击间隔；终端上区扣除会话栏、安全区，键盘下区扣除系统手势区。系统键盘避让后的可用窗口重新参与计算。
+3. 保持 TerminalContainer 与 ArkWeb 节点身份不变，只调整尺寸；字号改变后等待字体和单元格尺寸测量完成。
+4. 根据最终内容区和字形单元格尺寸向下取整计算 cols/rows，仅接受正数且实际变化的值。先更新终端，再发送同一代次的 SSH window-change；过期计算结果丢弃。
+5. 首次连接在有效尺寸可用后请求 PTY，再启动 shell；默认 TERM=xterm-256color，UTF-8 为首版编码约定。后台标签沿用最后有效尺寸，重新显示后再适配。
+
+外屏采用终端与紧凑 Extra Keys；完全展开优先扩大终端，不强制上下分区。字号与布局偏好持久化，SSH 连接不因这些设置变化而重建。
+
+## 5. 下屏键盘与触控交互
+
+### 5.1 两套候选布局
+
+完整布局候选为 75% 风格、六行键盘，下图只表达键位，不代表最终热区尺寸：
 
 ```text
 Esc  F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12  Del
@@ -101,64 +132,185 @@ Shift Z X  C  V  B  N  M  ,<  .>  /?  Shift      ↑
 Ctrl Fn 中/英 Alt       Space       AltGr Ctrl  ← ↓ →
 ```
 
-设计要点：
+紧凑布局采用五行及较少的横向键位，保留 Esc、Tab、Ctrl、Alt、Shift、退格、Enter 和方向键入口；低频键及部分符号进入可见的 Fn 层。F1～F12、Home、End、PgUp、PgDn、Delete 仍须可达，不能因紧凑布局而丢失功能。
 
-- `Esc`、独立 F1～F12、完整符号、左右 Ctrl/Alt、倒 T 方向键始终可用。
-- `Fn+方向键` 提供 Home、End、PgUp、PgDn；紧凑模式下用 `Fn+数字键`提供功能键。
-- 数字小键盘作为可选覆盖层，不常驻。这里是**键位桌面化**，不是实体键盘的全尺寸键距。
-- 下屏使用普通 ArkUI 组件，而不是依赖覆盖式的 `TextInput.customKeyboard`，这样更容易严格限制在折痕以下。
-- 按实际下屏尺寸计算 15u 网格；主键热区以约 48vp 为起点，空间不足时切换五行紧凑模式，不要无限缩小按键。
-- 支持真实多点组合，也支持粘滞修饰键：单击只作用于下一次组合，双击锁定，状态必须可见；切换会话或失焦时清除。
-- `Ctrl+C`固定发送远端中断，`Ctrl+Shift+C`才复制；`Ctrl+Shift+V`粘贴，多行和大段粘贴先警告。
-- 上屏支持滚动、长按选择、双指缩放；TUI 捕获鼠标时，可用 Shift 强制本地选择。
-- 接入外接键盘后，下屏可切换为快捷键、片段或触控板，但允许用户保留触屏键盘。
+初始功能层映射：Fn+1～0、-、= 对应 F1～F12，Fn+左/右/上/下对应 Home/End/PgUp/PgDn，Fn+Backspace 对应 Delete。层切换后显示当前键义；字母保持标准 QWERTY，符号层必须覆盖完整 ASCII 可打印符号，不依赖系统 IME 查找命令符号。
 
-### 4.3 其他设备形态
+15u × 48vp 已需要 720vp 宽度，尚未计入间距。原型必须记录实际窗口 vp 尺寸，按“可用宽度减间距与边距，再除总键宽单位”求热区；48vp 是候选目标，不是设备已满足的条件。减少一行只能缓解高度问题，横向不足必须减少同时显示的键位，不能无限缩小按键或让热区相互覆盖。
 
-- **完全展开**：单终端，可选会话侧栏，不机械保留上下分屏。
-- **外屏**：终端＋紧凑 Extra Keys，不硬塞完整键盘。
-- **分屏/悬浮窗**：只按实际窗口尺寸布局。
+原型比较两套布局与“系统键盘＋Extra Keys”基线，依据任务耗时、误触和终端可读性选择默认值。数字小键盘、片段面板和触控板不进入首版；用户可手动选择已通过验证的布局。
 
-## 5. 中文输入设计
+### 5.2 按键和手势规则
 
-华为[自定义键盘能力](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-customize-keyboard)解决的是键盘 UI，**并不自带拼音组字、词库和候选词引擎**。
+- 下屏使用普通 ArkUI 组件，固定在布局计算出的键盘区域，不依赖覆盖式 TextInput.customKeyboard 实现分区。
+- 支持多点组合；修饰键单击作用于下一次按键、双击锁定，状态可见。跟踪 pointerId，取消触摸、失焦、断线或切换会话时释放按住状态并清除锁定。
+- 区分 Caps 与 Shift；Fn 是本地布局层，不作为修饰字节发给服务器。退格和方向键支持可取消的长按重复，Ctrl/Alt、Enter 和粘贴不自动重复。
+- Ctrl+C 发送终端控制输入，通常由远端解释为中断；Ctrl+Shift+C 复制，Ctrl+Shift+V 粘贴。快捷键先由本地动作匹配，未匹配的按键才进入终端编码，避免双重处理。
+- 首版超过一行或超过 4KiB 的粘贴先预览并确认；单次上限初始为 1MiB，超限拒绝并说明。粘贴不额外添加换行，取消仅停止尚未发送的内容，已发送内容不能撤销。
+- 上屏滚动、长按选择、双指缩放；远端请求鼠标报告时提供可见的“本地选择”入口，物理键盘可用 Shift 强制选择。缩放影响字号并触发稳定后的 resize。
+- 接入物理键盘后可隐藏触屏键盘扩大终端；切换不重连。基本按键与组合键纳入首版验收，快捷面板和触控板后续实现。
 
-建议分两步：
+## 6. 输入协议与会话隔离
 
-1. **首版**：英文、符号和控制键直接发送；提供“系统中文”模式，通过真实输入焦点和系统 IME 输入，只把最终提交的 Unicode 文本发送一次，并采用 `KeyboardAvoidMode.RESIZE` 尽量保持终端可见。
-2. **严格要求中文候选也固定在下屏时**：后续在应用内键盘中接入离线拼音引擎，自己绘制预编辑和候选栏。除非还要给其他 App 使用，否则不必首版就开发系统级 `InputMethodExtensionAbility`。
+### 6.1 统一输入事件
 
-普通应用无法保证第三方系统 IME 的键盘和候选窗口始终落在物理下屏，这一点不能作为首版未经验证的承诺。
+InputRouter 接收以下语义事件，由 TerminalBackend 适配；不得让触屏、物理键盘和 IME 各自直接写 SSH：
 
-## 6. SSH、安全与断线恢复
+| 事件 | 内容 | 处理规则 |
+| --- | --- | --- |
+| Key | 键标识、修饰键、按下/释放/重复 | 结合当前终端模式编码；按键释放用于清理本地状态，不盲目发送字节 |
+| TextCommit | 最终 Unicode 文本、组字事务标识 | 只提交一次；不把拼音预编辑过程发送到远端 |
+| Paste | 用户确认的文本、粘贴事务标识 | 按当前 bracketed paste 模式处理，分批发送，不走逐键模拟 |
+| LocalAction | 复制、选择、切换布局等 | 本地消费，不再作为终端输入发送 |
 
-首版安全基线应包括：
+所有事件在产生时绑定 sessionId、connectionEpoch、inputEpoch 和 eventId。切换会话、输入模式或焦点所有者时更新 inputEpoch；重连更新 connectionEpoch。路由器拒绝过期事件，不在异步回调执行时重新读取“当前标签”作为目标。
 
-- 密码、公钥、`keyboard-interactive`，后者覆盖常见 MFA/跳板机交互。
-- 首次连接展示 SHA-256 主机密钥指纹并采用 TOFU；主机密钥变化默认阻止连接，且必须在校验主机后再认证。
-- 优先通过 [HUKS](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/huks-key-generation-overview) 生成和使用不可导出的 Ed25519 私钥；密码或密钥口令经用户同意后使用 [ASSET](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/asset-scenario1) 保存。
-- 私钥、密码不得进入 ArkWeb、日志或明文备份；旧算法只能按单个主机显式放开。
-- Agent forwarding、远端读取本地剪贴板默认关闭；OSC 52 写入剪贴板按主机配置为询问或允许，并限制大小。
-- SSH 自动重连只能重建连接，**不能自动恢复原 Shell**。首版推荐“重连＋远端 tmux”，Mosh 作为后续独立协议支持，不要把它当成 SSH 的一个开关。
+仅在连接为 OPEN、目标仍有效时接受终端输入；断线不缓存待重放命令。eventId/事务状态用于防重，不能按字符串去重，否则会吞掉用户连续输入的相同字符。
 
-## 7. 实施顺序
+### 6.2 模式与编码
 
-1. **真机技术验证**：折痕坐标与角度、90°布局、完整键盘焦点、xterm.js 性能、Native SSH、HUKS 签名、中文 IME。
-2. **MVP**：主机管理、三种认证、主机密钥校验、多会话、上下屏布局、完整特殊键、复制粘贴、滚动区、终端 resize、安全存储。
-3. **桌面体验完善**：自定义键位和片段、物理键盘/触控板、SFTP、跳板机、本地转发、中文输入增强。
-4. **按需扩展**：原生 Ghostty 渲染、远程/动态转发、Mosh、本地 Shell；均由实测需求驱动，不首发堆功能。
+[xterm.js 终端模式](https://xtermjs.org/docs/api/terminal/interfaces/imodes/)包括 applicationCursorKeysMode、applicationKeypadMode 和 bracketedPasteMode。XtermBackend 负责读取当前模式并统一处理方向键、功能键、修饰键和粘贴；优先复用终端已有输入处理能力，对触屏键盘必需的适配建立明确映射，不另外实现一套 VT 状态机。
 
-## 8. 验收标准
+原型要证明原生键盘事件进入 ArkWeb 的焦点与编码路径可用，不能假定合成 DOM KeyboardEvent 与真实按键行为完全相同。每个物理按键只能由一个入口处理；若经过模式感知适配器，必须阻止同一事件再次被 xterm 默认路径处理。
 
-发布前至少验证：
+终端输出通过 Uint8Array 交给 xterm 的流式 UTF-8 解码器，不能逐块转字符串破坏跨块字符；onData 按 UTF-8 编码，onBinary 按原始字节处理，避免破坏鼠标报告。[编码说明](https://xtermjs.org/docs/guides/encoding/)
 
-- `vim`、`tmux`、`htop`、true color、CJK/emoji、鼠标和 alternate screen 正常。
-- 反复进行“展开→90°→折叠→展开”，SSH 不重连，滚动区、选区和输入状态不丢失，`stty size` 与可见终端一致。
-- Ctrl/Alt/Esc/F 键、方向键、组合键和中文提交不重复、不串会话。
-- 大输出和大粘贴有背压与警告，UI 不被网络回调阻塞。
-- 错误主机密钥会被阻止，日志无秘密，Native SSH 通过恶意服务器与模糊测试。
-- Wi-Fi/蜂窝切换、熄屏、后台和进程被杀后的行为明确；不能把系统后台存活当作无限保证。
+## 7. 中文输入与焦点
 
-## 9. 核心产品决策
+华为[自定义键盘能力](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-customize-keyboard)提供键盘 UI 接入，不自带拼音组字、词库或候选词引擎。
 
-把“折叠姿态”和“桌面式输入”做好，而不是首版堆最多的协议。xterm.js＋Native SSH 是目前最平衡的起点，原生渲染和 Mosh 都可以在其后平滑增加。
+首版采用英文触屏输入与系统 IME 两种互斥模式：
+
+1. 英文模式由下屏键盘提交文本和按键；关闭自动纠错、首字母大写等会改变命令的行为。
+2. 切换系统中文时，停止触屏字符输入，释放修饰键，转移到一个真实可接收 IME 的输入焦点。原型先验证 xterm 自带输入路径；若需要 ArkUI 输入代理，则关闭另一条提交路径，不能同时从 text-change 与 composition-end 发送同一结果。
+3. 预编辑内容只在本地显示；以目标平台实际输入事件为准识别提交和取消，每次最终提交只发送一次。空格、Enter 在候选选择期间先交给 IME，不能同时触发远端空格或执行命令。
+4. 使用 KeyboardAvoidMode.RESIZE 验证系统键盘避让；系统 IME 出现时隐藏自定义键盘，按剩余空间布局。允许暂时退出物理上下屏布局，关闭后恢复用户选择。
+5. 切换会话、打开认证对话框或断线前，阻止新输入并结束/取消当前组字；已明确提交的文本只属于原会话，迟到回调因 inputEpoch 失效而丢弃。未提交预编辑不自动发送。
+
+普通应用不承诺第三方系统 IME 的键盘与候选窗口固定在物理下屏。若后续把这一点升级为必要需求，再接入离线拼音引擎并绘制候选栏；除非需要给其他 App 使用，否则不开发系统级 InputMethodExtensionAbility。
+
+## 8. SSH、凭据与连接恢复
+
+### 8.1 连接状态与主机信任
+
+连接流程为：IDLE → CONNECTING（含解析与握手）→ VERIFYING_HOST → AUTHENTICATING → OPEN。可取消阶段收到取消后进入 CLOSED 并释放资源；网络错误进入 FAILED 或有次数上限的 RETRY_WAIT，再开始新一代连接。用户主动关闭不触发重试。
+
+初始超时：网络连接、SSH 握手各 15 秒，单轮认证网络等待 30 秒；等待原生信任确认或凭据输入单独计时，初始 120 秒后取消，不能占住网络工作线程。真机按慢网络与 MFA 场景校准，错误需区分连接超时、握手失败、认证失败和用户取消。
+
+- 首次连接由原生 UI 展示实际目标地址、端口、主机密钥类型及 SHA-256 指纹，用户接受后保存 TOFU 信任记录。校验主机必须发生在发送认证秘密或使用私钥签名前。
+- 信任记录按规范化主机身份与端口保存，保留实际解析地址用于诊断；同一主机可能有多种密钥类型，不能把未见过的密钥自动当作可信。
+- 已知主机出现未知或变化的密钥时阻止连接。替换或增加信任需在主机管理中展示新旧指纹并由用户核实，禁止通过自动重连绕过。
+- 密码、公钥和 keyboard-interactive 分别实现。后者支持逐轮 challenge、echo 标志和取消，但是否满足具体 MFA 取决于服务端流程；测试部分认证成功后继续另一认证方式的组合。
+- 首版禁用旧算法；确有接入需求时按单个主机显式配置，不全局降级。
+
+### 8.2 凭据接入与存储
+
+主机配置只引用 credentialId，不嵌入私钥或密码。首次使用必须走通“添加主机 → 选择/创建凭据 → 建立服务器授权 → 校验指纹 → 连接”的流程。
+
+| 凭据类型 | 接入与使用 | 存储及迁移边界 |
+| --- | --- | --- |
+| 设备生成的密钥 | 优先用 HUKS 生成 Ed25519，经 Native 签名服务认证；导出 OpenSSH 公钥供用户添加到 authorized_keys | 私钥不可导出；原型验证设备算法支持、签名格式及解锁行为，不把 API 支持等同于所有设备的硬件安全等级 |
+| 已有 OpenSSH 私钥 | 通过用户选择文件导入；首版至少覆盖 Ed25519 的明文及口令加密格式，Native 解析并验证，错误格式明确拒绝 | 能安全导入 HUKS 的规格经验证后使用；否则由设备保护密钥加密后存入沙箱，仅 Native 临时解密签名，不能宣称原私钥从未可导出 |
+| 密码、私钥口令 | 原生安全输入框输入，默认仅本次使用；明确选择保存后使用 ASSET | 认证结束清理临时引用及可控缓冲，不记录值；MFA 一次性验证码不保存 |
+
+[HUKS 密钥生成](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/huks-key-generation-overview)、[签名规格](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides-v5/huks-signing-signature-verification-overview-V5)和 [ASSET](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/asset-scenario1)提供平台依据，具体安全属性由原型记录。HUKS 不支持所需规格时给出明确失败或用户可见的替代凭据选择，不静默降级。
+
+首版不自动上传或备份秘密。新设备应生成新密钥并重新授权；设备丢失时，用户须从服务器撤销旧公钥。应用内删除凭据只删除本地材料，需提示它不会同步删除服务器上的 authorized_keys。生成密钥时提供公钥复制与配置说明，不未经确认修改服务器授权文件。
+
+### 8.3 断线与重连
+
+- SSH 重连建立新连接，不能恢复旧 Shell。首版推荐用户使用远端 tmux，并提供可复制的 attach 示例；不在登录后自动执行未经配置的命令。
+- 连接断开立即禁用终端发送，取消未发送粘贴和认证请求，清空待发送队列、修饰键和组字状态；无法确认是否已到达服务器的命令也不自动重放。
+- 手动重连为默认行为。可选自动重连仅针对瞬时网络错误，初始最多 5 次、间隔 1/2/4/8/16 秒并加入抖动；认证失败、主机密钥变化或用户关闭不重试。每轮均重新校验主机，所需凭据不可用时回到原生提示，不暗中保存凭据。
+- 每次建立连接尝试使用新的 connectionEpoch，旧连接的输入、输出、ACK 和异步认证结果不得作用于新连接。
+- 断线后原滚动区可只读查看；手动重连前提示将重置本地终端屏幕和模式。开启自动重连时预先说明相同的重置行为，实际重连时展示连接代次变化。不把旧解析状态直接接到新 Shell；tmux 的工作区由服务器在 attach 后重绘。
+
+### 8.4 跳板机接入条件
+
+keyboard-interactive 是认证机制，不是跳转通道。[OpenSSH ProxyJump](https://man.openbsd.org/ssh_config#ProxyJump)先连接跳板机，再建立到目标的 TCP 转发。
+
+若首批机器依赖跳板机，MVP 增加单跳配置：跳板机与目标分别引用主机及凭据，先校验并认证跳板机，再通过 direct-tcpip 建立目标 SSH 握手；目标仍独立校验密钥和认证。目标私钥不上传跳板机，不依赖 agent forwarding。原型必须确认 SSH 库支持该传输接入方式及背压、取消和超时；多跳、堡垒机专有协议不隐含支持。
+
+若首版不需要此能力，界面和试用说明明确仅支持直连，不提前展示不可用的跳板机入口。
+
+### 8.5 后台、页面与进程异常
+
+| 场景 | 首版行为 |
+| --- | --- |
+| 姿态、字号、标签或页面切换，进程与 ArkWeb 存活 | 不重建连接或 xterm；保留滚动区，按新几何重排。取消未提交组字和临时修饰键；选区若因重排失效则明确清除，不保证任意 resize 后仍保持相同选择 |
+| 熄屏、进入后台 | 不假定网络任务可无限运行；遵守系统生命周期，记录状态。返回前台先禁用输入，通过需要服务器应答的保活请求检查连接；初始 10 秒内无应答则进入断线流程，不能仅因 socket 对象存在就显示可输入 |
+| Wi-Fi/蜂窝切换或网络中断 | 检测连接是否仍有效；失效则按重连策略处理，不承诺 SSH 无缝漫游 |
+| ArkWeb 渲染器崩溃或终端实例意外丢失 | 禁用受影响终端输入、关闭其 SSH 通道与连接并标记显示异常；提示重新连接。不用空白 xterm 继续控制旧通道，也不承诺仅凭 SSH 存活恢复屏幕状态 |
+| 应用进程被杀 | 不持久化 socket、VT 状态或待执行命令；重启只恢复主机、偏好和未连接标签。用户重新认证连接，再自行恢复 tmux |
+
+## 9. 数据流、背压与安全边界
+
+### 9.1 桥接协议与内存预算
+
+Native → ArkTS → ArkWeb 使用分批字节流；优先验证 WebMessagePort 等受控消息通道的二进制能力。若目标 SDK 需要文本封装，则只传结构化元数据与编码后的字节，不拼接远端内容为 JS 源码，不逐字节调用 runJavaScript。
+
+输出帧携带 sessionId、connectionEpoch、terminalGeneration、seq 和字节数；terminalGeneration 区分意外重建的终端实例。消息按会话有序处理，消费确认只接受该代次已发送、尚未确认的字节，拒绝重复、越界和过期 ACK。
+
+输出消费路径为：Native 读取 → 桥接投递 → xterm.write(bytes, callback) → 解析完成 ACK → 归还额度。ACK 表示解析完成而非消息已经送达，也不表示 GPU 已完成绘制。[xterm.js 流控指南](https://xtermjs.org/docs/guides/flowcontrol/)
+
+| 参数 | 初始值 | 用途 |
+| --- | --- | --- |
+| 单帧有效载荷上限 | 32KiB | 小批量投递，避免大消息占用 UI 线程 |
+| 每会话输出未消费高/低水位 | 256KiB / 64KiB | 达到高水位暂停继续取应用数据，下降至低水位再恢复 |
+| 每会话接收队列及在途未解析数据共享硬上限 | 1MiB 有效载荷 | Native 排队与桥接在途共同计入；不能把 ACK 移到桥接接收处规避统计 |
+| 每会话终端滚动区 | 5,000 行 | 各会话独立，终端解析状态与滚动区不属于字节队列预算 |
+| 每会话待发送输入 | 64KiB | 大粘贴按额度逐块取入，不一次塞入队列；拥塞时不无限接受新输入 |
+| 活动会话上限 | 4 | 控制连接与终端资源，达到后要求先关闭一个会话 |
+
+这些预算限制有效载荷，不能等同于进程实际内存；字符串、封装副本、VT 单元格、渲染和 SSH 库缓冲也必须测量。滚动区在 resize 重排后仍需裁剪，不向磁盘无限保存输出。
+
+背压必须传导到 SSH 通道读取与接收窗口，同时保持必要的 transport 事件、控制消息和出站输入处理，不能因暂停渲染而阻塞整个网络循环。原型验证所选 SSH 库内部缓冲是否仍增长；若不能保持硬上限，明确失败并关闭受影响连接，禁止静默丢弃终端字节后继续解析。
+
+向服务器发送输入时处理短写和 EAGAIN，保持每会话顺序。开始粘贴时固定该事务使用的 bracketed paste 模式，整个事务只发送一对边界，不能每个分块都重复包装。大粘贴期间 Ctrl+C 解释为“停止粘贴并发送 Ctrl+C”，同时提供可见的停止入口；清除未发送片段后发送控制输入，不把它压在整份粘贴之后。普通输入不插入尚未结束的 bracketed paste；取消时先完成因短写而只发送一部分的 UTF-8 码点或控制边界，再按已发送状态结束括号边界，不能直接截断。断线后清空事务，不向新连接补发边界。
+
+### 9.2 ArkWeb 与秘密的信任边界
+
+- 终端 HTML、JS、字体和 addon 随包发布，不加载 CDN、广告或动态脚本；禁止终端页面导航到远端内容，链接在独立上下文打开并限制协议。
+- 桥接只向受控终端页面开放白名单消息，验证来源、会话、代次、类型和长度；不提供任意文件读取、通用代码执行或导出凭据接口。
+- 私钥、SSH 认证密码和 MFA 回答不进入 ArkWeb，认证由原生 UI 与 Native 服务处理；日志和崩溃诊断不记录秘密或原始终端流。
+- 用户在远端 sudo、数据库客户端等程序中输入的密码会经过终端输入上下文。因此“密码不进入 ArkWeb”不适用于所有终端交互；ArkWeb 本身及随包脚本属于信任边界，不记录按键和剪贴板正文。[xterm.js 安全指南](https://xtermjs.org/docs/guides/security/)
+- 标题、链接、远端输出和 OSC 内容均按不可信数据处理，不插入 innerHTML 或执行代码。主机身份栏只显示本地可信配置，远端标题不能替代它。
+- 首版不开放 agent forwarding 或远端剪贴板读取。OSC 52 写入默认拒绝；按主机显式启用后，采用原生确认和初始 64KiB 解码后上限，超限拒绝。
+
+## 10. 实施阶段与决策门槛
+
+| 阶段 | 交付物 | 进入下一阶段的条件 |
+| --- | --- | --- |
+| A：需求与接入盘点 | 真实服务器清单、认证与密钥格式、是否需要跳板机、三类任务脚本 | 至少一台目标服务器的完整接入路径确定，必需能力进入 MVP 范围 |
+| B：真机纵向原型 | ArkUI 键盘 → 输入路由 → xterm → Native SSH 的最小闭环，姿态/IME/HUKS/背压记录 | 目标机器连通，组合键与中文不重复，姿态不主动重连，队列可控；SSH 库与桥接路径定版 |
+| C：键盘与布局验证 | 完整、紧凑、系统键盘基线的任务对比及可读性记录 | 三类任务均能完成，候选默认布局至少两类任务耗时不劣于基线且整体误触不高于基线；否则调整键位后重测 |
+| D：MVP 集成 | 主机与凭据、多会话、安全交互、异常恢复和完整验收记录 | 第 11 节必需项通过，无未处理的阻断问题；对外试用前列明不支持能力 |
+| E：体验扩展 | 按真实使用频率选择 SFTP、片段、转发或中文增强 | 不以新增协议替代已发现的键盘、连接和状态缺陷修复 |
+
+键盘测试：自用至少由使用者完成 3 轮；面向其他用户试用时至少邀请 5 名目标用户，轮换布局测试顺序。记录样本与个体结果，不把小样本结论包装成普遍效率提升。
+
+只有实测确认 ArkWeb 的输入、内存或渲染问题无法在合理成本内解决，才为原生 Ghostty 后端另做原型；接口预留不等于替换已验证为低成本。
+
+## 11. 验收矩阵与验证记录
+
+以下是发布门槛，当前均未执行。原型阶段可根据真机证据修订初始参数和性能目标，但修订必须记录原因，不能把未通过项目直接标记为通过。
+
+| 项目 | 可重复的验证方法 | 通过条件 |
+| --- | --- | --- |
+| 键盘任务 | 使用固定长路径、引号/管道命令、20 行配置和 tmux 快捷键，比较三套布局 | 三类任务完成且符合第 10 节对比门槛；记录时间、误触、字号、可见行列和是否需反复缩放 |
+| 姿态与 resize | 连续 100 次“展开 → 90° → 折叠 → 展开”，另测旋转、显示缩放、分屏和手动模式 | 单纯姿态变化不触发认证/重连；当前页稳定后 stty size 与实际行列一致；无零尺寸或过期 resize |
+| 终端兼容 | 固定版本的 vim、tmux、htop，覆盖 true color、CJK/emoji、alternate screen、鼠标、DECCKM 和 bracketed paste | 输入与画面符合参考终端行为；无乱码、残留模式或误执行。复杂字形不默认承诺与所有桌面终端一致 |
+| 输入隔离 | 至少 1,000 个含重复字符、控制键、长按取消的事件，在多会话间切换并穿插重连 | 有效输入无丢失、重复和串会话；预期取消及过期事件不发送；修饰键不会残留 |
+| 中文与焦点 | 每种宣称支持的 IME 至少 100 次提交/取消，覆盖候选 Enter、模式切换、认证弹窗和会话切换 | 每次提交恰好发送一次；预编辑及选词 Enter 不触发远端输入；迟到回调不进入新会话 |
+| 大输出与响应 | 持续输出 10 分钟，填满滚动区；分别测试 1 和 4 会话，并在输出中操作键盘与 Ctrl+C | 本地按键反馈 p95 ≤ 100ms；固定测试网络下 Ctrl+C 发送到停止新输出 p95 ≤ 1s；报告 RTT、吞吐和端到端延迟，不混为本地响应 |
+| 内存与背压 | 高频输出、暂停 ACK、恢复 ACK、长时间隐藏标签、resize 重排，统计各层预算和进程内存 | 额度不超硬上限、不静默丢字节；恢复后继续消费；缓存填满后稳定负载下内存无持续线性增长 |
+| 粘贴 | 验证多行、4KiB 阈值、1MiB 上限、超限、取消、慢链路、UTF-8 短写和 bracketed paste 中断 | 确认前不发送；不额外追加换行；内容有序且中断不截断编码单元；未发送部分可停止，发送队列有界且控制操作可响应 |
+| 主机信任与认证 | 首次/已知/变化密钥、拒绝信任、错误密码、加密私钥、逐轮 MFA、部分认证、取消与超时 | 校验前不认证；变化密钥阻止；取消释放资源；错误和过期认证结果不进入 OPEN |
+| 凭据生命周期 | 生成公钥并实际授权；导入支持格式；锁屏解锁；删除、重启和不可用密钥 | 真实登录成功；格式边界明确；SSH 私钥及认证凭据不进入 ArkWeb、日志或明文持久化；不支持时无静默降级 |
+| 网络与生命周期 | 各至少 10 次网络中断/切换、前后台、熄屏、进程强杀，另注入渲染器丢失 | 行为符合第 8 节；状态不假在线；不重放命令；不承诺跨进程保留终端；tmux 可经重新连接恢复 |
+| 桥接与恶意数据 | 注入乱序/重复 ACK、旧代次、超长消息、导航、恶意标题/链接/OSC；验证 Native 依赖的畸形报文与模糊测试结果 | 无越权桥接、秘密泄露和未处理崩溃；无额外页面获得控制能力；依赖已知安全问题有明确修复依据 |
+| 条件能力 | 若启用跳板机、额外密钥格式或认证组合，对真实目标做成功、失败、取消与重连测试 | 跳板机与目标分别校验和认证；所有对外宣称的能力都有记录，不支持项明确列出 |
+
+每次验证记录：提交号、设备型号、系统构建、SDK/ArkWeb/SSH/xterm 版本、窗口 px/vp 与旋转、键盘布局、字号与行列、服务器及测试程序版本、RTT/网络条件、步骤、预期、实际、通过/失败/未执行和相关问题。运行日志只含状态、代次、尺寸、计数与耗时，不含凭据、终端正文或剪贴板内容；人工合成的非敏感夹具可在测试报告中保留期望与实际片段，不采集真实服务器正文。
+
+当前待关闭的决策：真实接入是否需要跳板机、SSH 库与 HUKS 签名路径、物理键盘事件路径、桥接二进制能力、默认键盘布局及最小可用窗口、首批支持的 IME 和附加密钥格式。它们在相应阶段留存证据后定版，不以设计文档代替验证结果。
