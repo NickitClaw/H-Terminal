@@ -2,7 +2,39 @@
 
 H-Terminal 是一款专门适配 Huawei Pura X Max 折叠屏、HarmonyOS 7 的 SSH 终端 App。核心交互是在内屏约 90° 展开时，上方显示终端，下方提供适合命令行操作的桌面式键盘。
 
-**文档状态：方案设计，尚无实现及真机验证结果。** 更新日期：2026-10-24。文中的角度、尺寸、队列和性能数值均为待验证的初始值或验收目标，不代表已达到的能力。
+**文档状态：B 阶段纵向原型已实现，完整 MVP 尚未完成。** 文中的角度、尺寸、队列和性能数值仍为待验证的初始值或验收目标，不代表已达到的能力。以下状态严格区分模拟器证据、代码实现和真机未验证项。
+
+## 当前实现与验证状态
+
+当前代码采用 API 26、ArkUI、ArkWeb/xterm.js 和 Native C++ SSH。依赖固定为 `@xterm/xterm 6.0.0`、`@xterm/addon-fit 0.11.0`、libssh 0.12.2 和 OpenSSL 3.5.9；两个 ABI 均从源码构建，未使用社区旧预编译库。
+
+已实现：
+- 单个直连 SSH 会话、密码认证、原生主机指纹确认、TOFU known_hosts、PTY shell、断开与手动重连。
+- xterm 终端、UTF-8 字节流、输出解析完成 ACK、输入分块与 `inputCredit` 背压、会话/连接/终端/输入代次隔离。
+- 完整六行与紧凑五行键盘、符号层、粘滞修饰键、基本系统 IME、复制粘贴与安全粘贴授权。
+- 普通/手动上下布局、自动折叠状态监听、实际终端区域 resize 和窗口/折痕坐标校验。
+- OpenSSL/libssh 双 ABI 构建、HAP 打包、模拟器调试签名与安装脚本。
+
+构建与安装：
+
+```bash
+./scripts/build-debug.sh
+./scripts/sign-debug.sh entry/build/default/outputs/default/entry-default-unsigned.hap
+/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc install -r .runtime/signing/H-Terminal-signed.hap
+```
+
+`scripts/build-debug.sh` 会同步 xterm 资源、构建两个 ABI 的 Native 依赖并调用标准 hvigor。默认使用 `/Applications/DevEco-Studio.app/Contents`；自定义安装位置可通过 `DEVECO_HOME`、`DEVECO_SDK_ROOT` 指定。签名脚本使用 SDK 公开开发证书和当前模拟器 UDID，签名文件、测试凭据及运行日志只写入被忽略的 `.runtime`，不进入仓库。
+
+已在 Pura X Max 模拟器（HarmonyOS 7.0.0.107 SP8、API 26）验证：
+- 两个 ABI 的 Native 编译、HAP 内容、调试签名、安装和应用启动。
+- 首次指纹确认、错误密码拒绝、正确密码手动重连，以及主机密钥变化时阻止连接。
+- 触屏逐键输入 `echo ok` 并获得远端回显；`stty size` 返回 `15 102`；`Ctrl+C` 可中断 `sleep 30`。
+- `top` 全屏 TUI、`seq 1 10000` 大输出、完整/紧凑键盘切换、手动上下布局切换过程中连接保持。
+- 选择文本、`Ctrl+Shift+C/V`、PasteButton 授权后粘贴回终端；系统中文候选提交后 `你好` 恰好出现一次。
+
+尚未实现：主机配置管理、公钥/HUKS、keyboard-interactive/MFA、多会话、自动重连、跳板机、SFTP、片段、触控板、完整粘贴中断事务、OSC 52、Mosh。
+
+尚未验证：Pura X Max 真机的折叠角度/折痕和 100 次开合、实体键盘与多点触控、长时性能/内存门槛、全部 IME、完整粘贴边界、x86_64 运行，以及第 11 节完整发布验收矩阵。当前结果不等于完整 MVP 或发布条件已满足。
 
 ## 1. 产品目标与首版范围
 
@@ -89,7 +121,7 @@ MVP 每个标签使用独立 SSH 连接，降低多通道调度和背压互相�
 - 不自写 VT 解析器。首版只实现 XtermBackend；接口覆盖 feed、sendKey、commitText、paste、resize、selection 和 dispose，不承诺不同渲染后端之间运行中迁移状态。
 - SSH 在 Native 工作线程使用非阻塞模式运行，网络循环不得等待 UI 绘制或用户确认。签名、主机信任和认证提示通过可取消的请求返回结果。
 - libssh2 可利用[公钥签名回调](https://libssh2.org/libssh2_userauth_publickey.html)接入 HUKS，但仍需验证签名算法、公钥 wire format、线程模型和取消行为。
-- SSH 库在原型阶段定版。选择 libssh2 时固定经安全补丁核对的 tag/commit；若维护成本不可接受，评估 libssh 及其外部签名适配和 LGPL 交付要求。[libssh 安全发布记录](https://www.libssh.org/2026/07/28/libssh-0-12-2-security-release/)仅为参考，不把某个历史版本永久视为安全下限。
+- 当前原型已选用 libssh 0.12.2 并动态链接，源码版本、ABI 和校验值随构建脚本固定；后续安全更新仍须重新评审，不能把该历史版本永久视为安全下限。若后续改用 libssh2，必须固定经安全补丁核对的 tag/commit。HUKS 外部签名适配和 libssh 的 LGPL 交付要求仍需单独验证。[libssh 安全发布记录](https://www.libssh.org/2026/07/28/libssh-0-12-2-security-release/)用于版本依据。
 - 记录 SSH 库、加密依赖、xterm.js 及 addon 的版本、补丁与许可证；每次发布重新核对上游安全公告，并指定依赖更新负责人。
 
 ## 4. 姿态识别与终端布局
@@ -293,7 +325,7 @@ Native → ArkTS → ArkWeb 使用分批字节流；优先验证 WebMessagePort 
 
 ## 11. 验收矩阵与验证记录
 
-以下是发布门槛，当前均未执行。原型阶段可根据真机证据修订初始参数和性能目标，但修订必须记录原因，不能把未通过项目直接标记为通过。
+以下是完整发布门槛，尚未完整执行。上方“当前实现与验证状态”只记录已完成的原型子集，不表示下表项目已通过。原型阶段可根据真机证据修订初始参数和性能目标，但修订必须记录原因，不能把未通过项目直接标记为通过。
 
 | 项目 | 可重复的验证方法 | 通过条件 |
 | --- | --- | --- |
@@ -313,4 +345,4 @@ Native → ArkTS → ArkWeb 使用分批字节流；优先验证 WebMessagePort 
 
 每次验证记录：提交号、设备型号、系统构建、SDK/ArkWeb/SSH/xterm 版本、窗口 px/vp 与旋转、键盘布局、字号与行列、服务器及测试程序版本、RTT/网络条件、步骤、预期、实际、通过/失败/未执行和相关问题。运行日志只含状态、代次、尺寸、计数与耗时，不含凭据、终端正文或剪贴板内容；人工合成的非敏感夹具可在测试报告中保留期望与实际片段，不采集真实服务器正文。
 
-当前待关闭的决策：真实接入是否需要跳板机、SSH 库与 HUKS 签名路径、物理键盘事件路径、桥接二进制能力、默认键盘布局及最小可用窗口、首批支持的 IME 和附加密钥格式。它们在相应阶段留存证据后定版，不以设计文档代替验证结果。
+当前待关闭的决策：真实接入是否需要跳板机、HUKS 签名路径、物理键盘与多点触控路径、默认键盘布局及最小可用窗口、首批支持的 IME 和附加密钥格式。SSH 库已选定 libssh，当前桥接为结构化元数据加 Base64 分块；是否在后续改用二进制通道也需实测。它们在相应阶段留存证据后定版，不以设计文档代替验证结果。

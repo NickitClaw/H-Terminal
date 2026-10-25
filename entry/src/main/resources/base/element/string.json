@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "H-Terminal SSH client"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Foldable-first SSH terminal"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "H-Terminal"
+    }
+  ]
+}

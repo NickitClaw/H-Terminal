@@ -1,0 +1,7 @@
+{
+  "modelVersion": "5.1.0",
+  "description": "Foldable-first SSH terminal for HarmonyOS",
+  "dynamicDependencies": {},
+  "dependencies": {},
+  "devDependencies": {}
+}
