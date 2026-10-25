@@ -64,6 +64,10 @@
     post({ type: "error", code, fatal, ...identityFields(target) });
   }
 
+  function postReady() {
+    post({ type: "ready", protocolVersion: 1, ...identityFields(context) });
+  }
+
   function sameIdentity(a, b) {
     return (
       a &&
@@ -491,6 +495,7 @@
           recreateTerminal(term.options.fontSize, term.options.scrollback);
           fitTerminal(true);
           suppressXtermInput = false;
+          postReady();
         }
         pumpOutput();
       });
@@ -559,6 +564,7 @@
     term.options.scrollback = scrollback;
     if (!resetAfterWrite) {
       fitTerminal(true);
+      postReady();
     }
     return true;
   }
@@ -800,5 +806,4 @@
   }, true);
   window.open = () => null;
   window.HTerminal = Object.freeze({ receive });
-  post({ type: "ready", protocolVersion: 1 });
 })();

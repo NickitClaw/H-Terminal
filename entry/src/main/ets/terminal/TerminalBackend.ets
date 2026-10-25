@@ -31,4 +31,5 @@ export interface TerminalBackend {
   focus(ime: boolean): boolean;
   fit(): boolean;
   clear(): boolean;
+  reload(): boolean;
 }

@@ -18,7 +18,12 @@ namespace {
 constexpr size_t kOutputFrameLimit = 32 * 1024;
 constexpr size_t kOutputHighWater = 256 * 1024;
 constexpr size_t kOutputLowWater = 64 * 1024;
-constexpr size_t kOutputHardLimit = 1024 * 1024;
+// libssh 0.12.2 channels.c grants 64 * 32768 bytes and accounts for both
+// channel streams before replenishing that window. Bytes already granted to
+// the peer may still arrive while the renderer is paused. Reserve that window
+// separately from bytes handed to the renderer but not yet acknowledged.
+constexpr size_t kSshReceiveWindow = 2 * 1024 * 1024;
+constexpr size_t kOutputHardLimit = kSshReceiveWindow + kOutputHighWater;
 constexpr size_t kInputQueueLimit = 64 * 1024;
 constexpr size_t kMaxUnackedFrames = 4096;
 constexpr size_t kMaxRememberedEventIds = 4096;
@@ -821,8 +826,8 @@ void Session::ProcessResize() {
 
 bool Session::EmitOutput(const uint8_t *data, size_t length) {
     if (length == 0 || length > kOutputFrameLimit || nextSeq_ == 0 || nextSeq_ > kMaxSafeInteger ||
-        outputOutstanding_ > kOutputHardLimit - length) {
-        Fail("output frame or receive budget overflow");
+        outputOutstanding_ > kOutputHighWater - length) {
+        Fail("output frame or in-flight budget overflow");
         return false;
     }
     uint64_t seq = nextSeq_++;
@@ -844,7 +849,8 @@ bool Session::EmitOutput(const uint8_t *data, size_t length) {
 }
 
 void Session::ReadOutputStream(int stream, size_t &available) {
-    size_t length = std::min(available, kOutputFrameLimit);
+    size_t credit = kOutputHighWater - outputOutstanding_;
+    size_t length = std::min({available, kOutputFrameLimit, credit});
     if (length == 0) {
         return;
     }
@@ -884,15 +890,14 @@ void Session::PollOutput() {
     }
     size_t buffered = available[0] + available[1];
     if (outputOutstanding_ > kOutputHardLimit || buffered > kOutputHardLimit - outputOutstanding_) {
-        Fail("receive queue and in-flight output exceeded 1 MiB");
+        Fail("receive queue and in-flight output exceeded the receive budget");
         return;
     }
-    size_t total = outputOutstanding_ + buffered;
     if (outputPaused_) {
         if (outputOutstanding_ <= kOutputLowWater) {
             outputPaused_ = false;
         }
-    } else if (total >= kOutputHighWater) {
+    } else if (outputOutstanding_ >= kOutputHighWater) {
         outputPaused_ = true;
     }
     if (remoteEof_ && buffered == 0) {
@@ -912,8 +917,7 @@ void Session::PollOutput() {
             return;
         }
     }
-    total = outputOutstanding_ + available[0] + available[1];
-    if (total >= kOutputHighWater) {
+    if (outputOutstanding_ >= kOutputHighWater) {
         outputPaused_ = true;
     }
     if (!outputPaused_ && available[1] > 0 && unackedFrames_.size() < kMaxUnackedFrames) {
@@ -922,8 +926,7 @@ void Session::PollOutput() {
             return;
         }
     }
-    total = outputOutstanding_ + available[0] + available[1];
-    if (total >= kOutputHighWater) {
+    if (outputOutstanding_ >= kOutputHighWater) {
         outputPaused_ = true;
     }
 }

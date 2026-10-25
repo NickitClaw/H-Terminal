@@ -394,7 +394,8 @@ struct Index {
           .onChange((value: string): void => {
             this.password = value;
           })
-        Text(this.snapshot.terminalReady ? this.snapshot.message : '正在初始化终端…')
+        Text(this.snapshot.terminalReady || this.snapshot.state === ConnectionState.FAILED
+          ? this.snapshot.message : '正在初始化终端…')
           .fontSize(12)
           .fontColor('#9AA9B8')
           .maxLines(3)
@@ -412,12 +413,20 @@ struct Index {
               }
               this.showConnect = false;
             })
-          Button('连接')
+          Button(!this.snapshot.terminalReady && this.snapshot.state === ConnectionState.FAILED
+            ? '重新加载终端' : '连接')
             .layoutWeight(1)
             .margin({ left: 10 })
-            .enabled(this.snapshot.terminalReady)
+            .enabled(this.snapshot.terminalReady || this.snapshot.state === ConnectionState.FAILED)
             .onClick((): void => {
-              this.connect();
+              if (!this.snapshot.terminalReady) {
+                this.password = '';
+                this.imeMode = false;
+                this.showPasteAuthorization = false;
+                this.session.recoverTerminal();
+              } else {
+                this.connect();
+              }
             })
         }
         .width('100%')

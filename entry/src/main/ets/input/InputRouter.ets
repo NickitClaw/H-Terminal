@@ -91,7 +91,8 @@ export class InputRouter {
       this.afterKey();
       return routed;
     }
-    if (routed.ctrl && routed.shift && (definition.id.toLowerCase() === 'c' || definition.id.toLowerCase() === 'v')) {
+    if (routed.ctrl && routed.shift && !routed.alt &&
+      (definition.id.toLowerCase() === 'c' || definition.id.toLowerCase() === 'v')) {
       routed.kind = 'action';
       routed.action = definition.id.toLowerCase() === 'c' ? 'copy' : 'paste';
       this.afterKey();
@@ -106,12 +107,20 @@ export class InputRouter {
         return routed;
       }
     }
-    if (definition.kind === 'key' || routed.ctrl || routed.alt) {
+    if (definition.kind === 'key') {
       routed.kind = 'key';
-      routed.key = definition.kind === 'key' ? definition.id : definition.output;
+      routed.key = definition.id;
     } else {
-      routed.kind = 'text';
-      routed.text = this.resolveText(definition);
+      const text = this.resolveText(definition);
+      if (routed.ctrl || routed.alt) {
+        routed.kind = 'key';
+        routed.key = text;
+      } else {
+        routed.kind = 'text';
+        routed.text = text;
+      }
+      // Shift/Caps have already selected the printable character. Keeping
+      // Shift here would apply it twice (notably Alt+Caps+Shift+A).
       routed.shift = false;
     }
     this.afterKey();

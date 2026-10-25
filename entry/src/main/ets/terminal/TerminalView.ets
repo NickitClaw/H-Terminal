@@ -26,11 +26,17 @@ export struct TerminalView {
   });
 
   aboutToAppear(): void {
+    this.backend.setReloader((): void => {
+      this.webController.refresh();
+    });
     this.backend.setSender((message: TerminalMessage): void => {
+      const bridgeEpoch = this.backend.getBridgeEpoch();
       const payload = JSON.stringify(JSON.stringify(message));
       this.webController.runJavaScript(`window.HTerminal.receive(${payload})`)
         .catch((error: BusinessError): void => {
-          this.onFailure(error.message);
+          if (bridgeEpoch === this.backend.getBridgeEpoch()) {
+            this.onFailure(error.message);
+          }
         });
     });
   }

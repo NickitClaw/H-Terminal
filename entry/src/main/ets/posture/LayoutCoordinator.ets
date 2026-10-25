@@ -1,4 +1,4 @@
-import { PostureSnapshot, PostureState } from './PostureEngine';
+import { LayoutPreference, PostureEngine, PostureSnapshot, PostureState } from './PostureEngine';
 
 export class LayoutResult {
   terminalWidth: number = 0;
@@ -22,14 +22,26 @@ export class LayoutCoordinator {
     }
 
     if (snapshot.state === PostureState.LAPTOP) {
-      let top = height / 2;
-      let bottom = height / 2;
-      if (snapshot.crease.length > 0 && !snapshot.syntheticSplit) {
-        const rect = snapshot.crease[0];
-        top = rect.top - snapshot.windowTop - rootGlobalY;
-        bottom = rect.top + rect.height - snapshot.windowTop - rootGlobalY;
-      } else if (!snapshot.syntheticSplit) {
-        return LayoutCoordinator.normalLayout(result, width, height);
+      let top = -1;
+      let bottom = -1;
+      if (!snapshot.syntheticSplit) {
+        for (let index = 0; index < snapshot.crease.length; index++) {
+          const rect = snapshot.crease[index];
+          if (!PostureEngine.isHorizontalCrease(rect) || rect.left >= width || rect.left + rect.width <= 0) {
+            continue;
+          }
+          const candidateTop = rect.top - snapshot.windowTop - rootGlobalY;
+          const candidateBottom = candidateTop + rect.height;
+          if (candidateTop >= 160 && height - candidateBottom >= 200) {
+            top = candidateTop;
+            bottom = candidateBottom;
+            break;
+          }
+        }
+      }
+      if (top < 0 && snapshot.preference === LayoutPreference.LAPTOP) {
+        top = height / 2;
+        bottom = top;
       }
       if (top >= 160 && height - bottom >= 200 && bottom >= top) {
         result.terminalHeight = top;

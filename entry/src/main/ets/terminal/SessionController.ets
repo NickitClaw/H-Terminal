@@ -37,6 +37,9 @@ export class SessionController {
   private pendingInputs: PendingInput[] = [];
   private pendingInputBytes: number = 0;
   private attemptActive: boolean = false;
+  private rendererFailed: boolean = false;
+  private terminalInitialized: boolean = false;
+  private rendererRecovering: boolean = false;
 
   constructor(backend: XtermBackend) {
     this.backend = backend;
@@ -175,6 +178,27 @@ export class SessionController {
     this.failRenderer(message);
   }
 
+  recoverTerminal(): boolean {
+    if (!this.rendererFailed) {
+      return false;
+    }
+    this.backend.markWebNotReady();
+    this.terminalGeneration++;
+    this.terminalSize = new TerminalSize();
+    this.rendererFailed = false;
+    this.terminalInitialized = false;
+    this.rendererRecovering = true;
+    this.snapshot.terminalReady = false;
+    this.clearPendingInputs();
+    this.invalidateInput();
+    this.publish(ConnectionState.IDLE, '正在重新加载终端');
+    if (!this.backend.reload()) {
+      this.failRenderer('终端重新加载失败，请重试');
+      return false;
+    }
+    return true;
+  }
+
   handleTerminalMessage(json: string): void {
     let message: TerminalMessage;
     try {
@@ -182,14 +206,15 @@ export class SessionController {
     } catch (_error) {
       return;
     }
+    if (this.rendererFailed) {
+      return;
+    }
     if (message.type === 'ready') {
-      const ready = new SessionSnapshot();
-      ready.state = this.snapshot.state;
-      ready.message = this.snapshot.message;
-      ready.terminalReady = true;
-      ready.inputEnabled = ready.state === ConnectionState.OPEN;
-      this.snapshot = ready;
-      this.onSnapshot(ready);
+      if (!this.isCurrentTerminalMessage(message)) {
+        return;
+      }
+      this.terminalInitialized = true;
+      this.publishTerminalReady();
       this.backend.fit();
       return;
     }
@@ -208,6 +233,7 @@ export class SessionController {
       if (changed && this.snapshot.state === ConnectionState.OPEN) {
         native.resize(this.sessionId, this.connectionEpoch, cols, rows);
       }
+      this.publishTerminalReady();
       return;
     }
     if (message.type === 'error') {
@@ -323,6 +349,21 @@ export class SessionController {
       message.terminalGeneration === this.terminalGeneration;
   }
 
+  private publishTerminalReady(): void {
+    if (this.snapshot.terminalReady || !this.terminalInitialized || this.rendererFailed ||
+      this.terminalSize.cols <= 0 || this.terminalSize.rows <= 0) {
+      return;
+    }
+    const ready = new SessionSnapshot();
+    ready.state = this.snapshot.state;
+    ready.message = this.rendererRecovering ? '终端已重新加载，请连接' : this.snapshot.message;
+    ready.terminalReady = true;
+    ready.inputEnabled = ready.state === ConnectionState.OPEN;
+    this.rendererRecovering = false;
+    this.snapshot = ready;
+    this.onSnapshot(ready);
+  }
+
   private enqueueInput(message: TerminalMessage): void {
     if (!this.snapshot.inputEnabled || message.inputEpoch !== this.input.getInputEpoch() ||
       (message.eventId ?? '').length === 0) {
@@ -393,6 +434,10 @@ export class SessionController {
     if (this.connectionEpoch > 0) {
       native.closeSession(this.sessionId, this.connectionEpoch);
     }
+    this.rendererFailed = true;
+    this.terminalInitialized = false;
+    this.rendererRecovering = false;
+    this.backend.markWebNotReady();
     this.snapshot.terminalReady = false;
     this.clearPendingInputs();
     this.invalidateInput();

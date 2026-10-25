@@ -5,6 +5,8 @@ export type TerminalMessageSender = (message: TerminalMessage) => void;
 
 export class XtermBackend implements TerminalBackend {
   private sender: TerminalMessageSender | null = null;
+  private reloader: (() => void) | null = null;
+  private bridgeEpoch: number = 0;
   private webReady: boolean = false;
   private pending: TerminalMessage[] = [];
   private sessionId: string = '';
@@ -14,6 +16,14 @@ export class XtermBackend implements TerminalBackend {
 
   setSender(sender: TerminalMessageSender): void {
     this.sender = sender;
+  }
+
+  setReloader(reloader: () => void): void {
+    this.reloader = reloader;
+  }
+
+  getBridgeEpoch(): number {
+    return this.bridgeEpoch;
   }
 
   markWebReady(): void {
@@ -26,8 +36,21 @@ export class XtermBackend implements TerminalBackend {
   }
 
   markWebNotReady(): void {
+    this.bridgeEpoch++;
     this.webReady = false;
     this.pending = [];
+  }
+
+  reload(): boolean {
+    if (this.reloader === null) {
+      return false;
+    }
+    try {
+      this.reloader();
+      return true;
+    } catch (_error) {
+      return false;
+    }
   }
 
   configure(sessionId: string, connectionEpoch: number, terminalGeneration: number, inputEpoch: number): boolean {

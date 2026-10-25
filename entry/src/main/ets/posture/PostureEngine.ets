@@ -62,6 +62,12 @@ export class PostureEngine {
     this.evaluate();
   };
 
+  static isHorizontalCrease(rect: CreaseRect): boolean {
+    return Number.isFinite(rect.left) && Number.isFinite(rect.top) &&
+      Number.isFinite(rect.width) && Number.isFinite(rect.height) &&
+      rect.height >= 0 && rect.width > rect.height;
+  }
+
   start(): void {
     if (this.started) {
       return;
@@ -192,7 +198,7 @@ export class PostureEngine {
     }
     for (let index = 0; index < this.crease.length; index++) {
       const rect = this.crease[index];
-      if (rect.width > rect.height && rect.width > 0) {
+      if (PostureEngine.isHorizontalCrease(rect)) {
         return true;
       }
     }
@@ -217,7 +223,8 @@ export class PostureEngine {
     }
     snapshot.crease = this.crease;
     snapshot.syntheticSplit = this.preference === LayoutPreference.LAPTOP &&
-      (this.crease.length === 0 || !this.windowGeometryValid || !this.windowFullScreen ||
+      (!this.crease.some((rect: CreaseRect): boolean => PostureEngine.isHorizontalCrease(rect)) ||
+        !this.windowGeometryValid || !this.windowFullScreen ||
         this.windowDisplayId !== this.displayId);
     snapshot.message = message;
     this.onChanged(snapshot);
