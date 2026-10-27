@@ -24,7 +24,7 @@ BUILD_DIR="$ROOT_DIR/third_party/build"
 INSTALL_DIR="$ROOT_DIR/third_party/install"
 JOBS="${JOBS:-4}"
 
-for tool in curl perl make shasum tar; do
+for tool in curl perl make shasum tar patch; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "missing host tool: $tool" >&2
         exit 1
@@ -74,6 +74,7 @@ fetch_and_verify "$OPENSSL_URL" "$OPENSSL_ARCHIVE" "$OPENSSL_SHA256"
 fetch_and_verify "$LIBSSH_URL" "$LIBSSH_ARCHIVE" "$LIBSSH_SHA256"
 extract_source "$OPENSSL_ARCHIVE" "$OPENSSL_SOURCE"
 extract_source "$LIBSSH_ARCHIVE" "$LIBSSH_SOURCE"
+patch -d "$LIBSSH_SOURCE" -p1 -F 0 < "$ROOT_DIR/patches/libssh-0.12.2-drain-buffered-output.patch"
 
 build_abi() {
     local abi="$1"

@@ -82,4 +82,20 @@ function createTerminalHarness(onMessage = () => {}) {
   };
 }
 
-module.exports = { createEtsLoader, createTerminalHarness, ByteCodec };
+// ArkUI's build DSL is not TypeScript. Extract only the real page methods
+// under test, leaving rendering and platform interfaces to the fixture.
+function loadPageMethods(names, globals) {
+  const text = fs.readFileSync(path.join(projectRoot, 'entry/src/main/ets/pages/Index.ets'), 'utf8')
+    .replace('struct Index {', 'class Index {');
+  const source = ts.createSourceFile('Index.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const page = source.statements.find((node) => ts.isClassDeclaration(node) && node.name.text === 'Index');
+  const methods = names.map((name) => page.members.find((node) => node.name?.getText(source) === name).getText(source));
+  const output = ts.transpileModule(`class Page { ${methods.join('\n')} }\nmodule.exports = Page;`, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+  }).outputText;
+  const module = { exports: {} };
+  new Function('module', ...Object.keys(globals), output)(module, ...Object.values(globals));
+  return module.exports;
+}
+
+module.exports = { createEtsLoader, createTerminalHarness, ByteCodec, loadPageMethods };

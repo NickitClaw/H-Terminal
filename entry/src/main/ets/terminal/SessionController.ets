@@ -81,9 +81,17 @@ export class SessionController {
       this.onToast('请检查主机、端口和用户名');
       return false;
     }
+    const initialCols = this.terminalSize.cols;
+    const initialRows = this.terminalSize.rows;
     this.clearPendingInputs();
     this.connectionEpoch++;
     this.input.beginSession(this.sessionId, this.connectionEpoch);
+    // A new identity may wait for the previous xterm.write callback before
+    // recreating the terminal. Native OPEN alone must not enable input.
+    this.terminalInitialized = false;
+    this.snapshot.terminalReady = false;
+    this.snapshot.inputEnabled = false;
+    this.terminalSize = new TerminalSize();
     this.backend.clear();
     this.backend.configure(this.sessionId, this.connectionEpoch, this.terminalGeneration, this.input.getInputEpoch());
     const options: NativeConnectOptions = {
@@ -95,8 +103,8 @@ export class SessionController {
       port: port,
       username: normalizedUser,
       password: password,
-      cols: this.terminalSize.cols,
-      rows: this.terminalSize.rows
+      cols: initialCols,
+      rows: initialRows
     };
     this.attemptActive = true;
     this.publish(ConnectionState.CONNECTING, '正在连接');

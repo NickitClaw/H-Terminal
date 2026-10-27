@@ -24,6 +24,7 @@ endif()
 add_library(entry SHARED
     entry.cpp
     session.cpp
+    session_registry.cpp
 )
 add_library(hterminal_ssh SHARED IMPORTED)
 set_target_properties(hterminal_ssh PROPERTIES

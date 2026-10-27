@@ -20,6 +20,7 @@ namespace hterminal {
 class Session final : public std::enable_shared_from_this<Session> {
 public:
     Session(std::unique_ptr<NativeConnectOptions> options, NativeEventSink &sink);
+    Session(std::unique_ptr<NativeConnectOptions> options, std::shared_ptr<NativeEventSink> sink);
     ~Session();
 
     Session(const Session &) = delete;
@@ -128,6 +129,7 @@ private:
     bool IsOpenForInput() const;
 
     std::unique_ptr<NativeConnectOptions> options_;
+    std::shared_ptr<NativeEventSink> ownedSink_;
     NativeEventSink &sink_;
     std::atomic<PublicState> state_{PublicState::Idle};
     std::atomic<bool> closeRequested_{false};
@@ -172,6 +174,7 @@ private:
     bool outputPaused_ = false;
     uint64_t nextSeq_ = 1;
     bool remoteEof_ = false;
+    bool transportError_ = false;
 };
 
 } // namespace hterminal

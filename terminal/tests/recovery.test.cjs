@@ -25,7 +25,7 @@ function fixture() {
   backend.setReloader(() => { calls.reload++; });
   controller.initialize('/isolated-fixture');
   return {
-    calls, controller, backend, web,
+    calls, controller, backend, web, emitNative: (event) => onNativeEvent(event),
     get snapshot() { return snapshot; },
     open() {
       assert.equal(controller.connect('127.0.0.1', 22224, 'review', 'review'), true);
@@ -109,4 +109,35 @@ test('identity-scoped ready still needs valid terminal measurements', () => {
   assert.equal(f.snapshot.terminalReady, false);
   f.controller.handleTerminalMessage(JSON.stringify({ type: 'resize', ...identity, cols: 80, rows: 24 }));
   assert.equal(f.snapshot.terminalReady, true);
+});
+
+test('reconnect waits for the old write and fresh identity readiness before accepting keys', () => {
+  const f = fixture();
+  f.backend.markWebReady();
+  f.open();
+  const oldReady = f.web.messages.filter((message) => message.type === 'ready').at(-1);
+  let finishWrite;
+  f.web.terminal.write = (_bytes, callback) => { finishWrite = callback; };
+  f.emitNative({ ...f.calls.connect.at(-1), type: 'output', seq: 1, byteLength: 1, data: 'WA==' });
+  assert.equal(typeof finishWrite, 'function');
+  f.controller.disconnect();
+  assert.equal(f.controller.connect('127.0.0.1', 22224, 'review', 'review'), true);
+  const options = f.calls.connect.at(-1);
+  assert.equal(options.cols, 80);
+  f.emitNative({ ...options, type: 'state', state: 'OPEN' });
+  assert.equal(f.snapshot.terminalReady, false);
+  assert.equal(f.snapshot.inputEnabled, false);
+  f.controller.handleTerminalMessage(JSON.stringify(oldReady));
+  f.controller.handleTerminalMessage(JSON.stringify({ ...oldReady, type: 'resize', cols: 80, rows: 24 }));
+  assert.equal(f.snapshot.inputEnabled, false);
+  const key = { kind: 'key', id: 'ArrowUp' };
+  f.controller.routeKey(key);
+  assert.equal(f.calls.write.length, 0);
+  finishWrite();
+  assert.equal(f.snapshot.terminalReady, true);
+  assert.equal(f.snapshot.inputEnabled, true);
+  f.controller.routeKey(key);
+  assert.equal(f.calls.write.length, 1);
+  assert.equal(f.calls.write[0].connectionEpoch, options.connectionEpoch);
+  assert.equal(Buffer.from(f.calls.write[0].data, 'base64').toString(), '\x1b[A');
 });

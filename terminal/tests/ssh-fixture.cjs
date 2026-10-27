@@ -31,7 +31,20 @@ const server = new Server({ hostKeys: [privateKey] }, (client) => {
         while ((boundary = input.indexOf('\r')) !== -1) {
           const command = input.slice(0, boundary);
           input = input.slice(boundary + 1);
-          if (command === 'burst') {
+          if (['close', 'late-tail', 'stderr-close', 'disconnect'].includes(command)) {
+            const output = command === 'stderr-close' ? stream.stderr : stream;
+            output.write(Buffer.alloc(512 * 1024, command === 'stderr-close' ? 'E' : 'X'));
+            output.write('\r\nEND\r\n');
+            if (command === 'disconnect') {
+              // No channel EOF: the client must retain valid buffered bytes
+              // while still reporting the transport failure.
+              setTimeout(() => client.end(), 50);
+            } else {
+              stream.exit(0);
+              stream.on('finish', () => { stream.close(); client.end(); });
+              stream.end();
+            }
+          } else if (command === 'burst') {
             stream.write(payload);
             stream.write('\r\nEND\r\n');
           } else if (command === 'control') {

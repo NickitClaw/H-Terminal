@@ -70,6 +70,10 @@ std::string Base64(const uint8_t *data, size_t length) {
 Session::Session(std::unique_ptr<NativeConnectOptions> options, NativeEventSink &sink)
     : options_(std::move(options)), sink_(sink), cols_(options_->cols), rows_(options_->rows) {}
 
+Session::Session(std::unique_ptr<NativeConnectOptions> options, std::shared_ptr<NativeEventSink> sink)
+    : options_(std::move(options)), ownedSink_(std::move(sink)), sink_(*ownedSink_),
+      cols_(options_->cols), rows_(options_->rows) {}
+
 Session::~Session() {
     Stop();
     SecureClear(options_->password);
@@ -364,7 +368,7 @@ void Session::Run() {
 }
 
 void Session::Advance() {
-    if (stage_ != Stage::Connect && stage_ != Stage::Finished && session_ != nullptr &&
+    if (stage_ != Stage::Connect && stage_ != Stage::Finished && stage_ != Stage::Open && session_ != nullptr &&
         !ssh_is_connected(session_) && !remoteEof_) {
         Fail("SSH transport disconnected");
         return;
@@ -614,10 +618,19 @@ void Session::WaitForNetwork() {
     if (stage_ == Stage::Finished) {
         return;
     }
+    if (transportError_) {
+        std::this_thread::sleep_for(kPollInterval);
+        return;
+    }
     if (event_ != nullptr) {
         int result = ssh_event_dopoll(event_, static_cast<int>(kPollInterval.count()));
         if (result == SSH_ERROR && !closeRequested_.load(std::memory_order_acquire)) {
-            Fail("SSH network polling failed");
+            if (stage_ == Stage::Open) {
+                transportError_ = true;
+                acceptingInput_.store(false, std::memory_order_release);
+            } else {
+                Fail("SSH network polling failed");
+            }
         }
         return;
     }
@@ -875,18 +888,24 @@ void Session::ReadOutputStream(int stream, size_t &available) {
 
 void Session::PollOutput() {
     size_t available[2] = {0, 0};
-    for (int stream = 0; stream < 2; ++stream) {
-        int result = ssh_channel_poll(channel_, stream);
-        if (result == SSH_EOF) {
-            remoteEof_ = true;
-            acceptingInput_.store(false, std::memory_order_release);
-            continue;
+    auto pollStreams = [this, &available]() {
+        for (int stream = 0; stream < 2; ++stream) {
+            int result = ssh_channel_poll(channel_, stream);
+            available[stream] = result > 0 ? static_cast<size_t>(result) : 0;
+            if (result == SSH_EOF) {
+                remoteEof_ = true;
+                acceptingInput_.store(false, std::memory_order_release);
+            } else if (result < 0) {
+                transportError_ = true;
+                acceptingInput_.store(false, std::memory_order_release);
+            }
         }
-        if (result < 0) {
-            Fail("SSH channel polling failed");
-            return;
-        }
-        available[stream] = static_cast<size_t>(result);
+    };
+    pollStreams();
+    if (remoteEof_ || transportError_ || ssh_channel_is_closed(channel_)) {
+        // Polling stderr may process packets that append stdout after its
+        // first sample. Recheck both buffers once the terminal status is known.
+        pollStreams();
     }
     size_t buffered = available[0] + available[1];
     if (outputOutstanding_ > kOutputHardLimit || buffered > kOutputHardLimit - outputOutstanding_) {
@@ -902,6 +921,10 @@ void Session::PollOutput() {
     }
     if (remoteEof_ && buffered == 0) {
         HandleRemoteClosed();
+        return;
+    }
+    if (transportError_ && buffered == 0) {
+        Fail("SSH transport disconnected after output drained");
         return;
     }
     if (ssh_channel_is_closed(channel_) && buffered == 0) {
@@ -942,7 +965,7 @@ void Session::HandleRemoteClosed() {
 
 void Session::AdvanceOpen() {
     PollOutput();
-    if (failed_ || remoteClosed_ || remoteEof_) {
+    if (failed_ || remoteClosed_ || remoteEof_ || transportError_) {
         return;
     }
     ProcessResize();

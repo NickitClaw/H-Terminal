@@ -6,6 +6,7 @@ import { XtermBackend } from '../terminal/XtermBackend';
 import { SessionController } from '../terminal/SessionController';
 import { InputRouter, ModifierSnapshot } from '../input/InputRouter';
 import { KeyDefinition, KeyboardLayoutMode } from '../input/KeyboardModel';
+import { PasteRequestContext } from '../input/PasteRequestContext';
 import { LaptopKeyboard } from '../components/LaptopKeyboard';
 import { LayoutPreference, PostureEngine, PostureSnapshot } from '../posture/PostureEngine';
 import { LayoutCoordinator, LayoutResult } from '../posture/LayoutCoordinator';
@@ -34,15 +35,16 @@ struct Index {
   private session: SessionController = new SessionController(this.backend);
   private postureEngine: PostureEngine = new PostureEngine();
   private fitTimer: number = -1;
-  private pasteSessionId: string = '';
-  private pasteConnectionEpoch: number = 0;
-  private pasteInputEpoch: number = 0;
+  private pendingPaste: PasteRequestContext | null = null;
   private windowGeometryRequest: number = 0;
 
   aboutToAppear(): void {
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
     this.session.onSnapshot = (snapshot: SessionSnapshot): void => {
       this.snapshot = snapshot;
+      if (!snapshot.inputEnabled) {
+        this.cancelPasteRequest();
+      }
       if (snapshot.state === ConnectionState.OPEN) {
         this.showConnect = false;
       } else if (snapshot.state === ConnectionState.FAILED) {
@@ -77,7 +79,7 @@ struct Index {
 
   aboutToDisappear(): void {
     this.password = '';
-    this.showPasteAuthorization = false;
+    this.cancelPasteRequest();
     this.postureEngine.stop();
     this.session.dispose();
     if (this.fitTimer >= 0) {
@@ -116,9 +118,8 @@ struct Index {
 
   private requestPasteAuthorization(): void {
     if (this.snapshot.inputEnabled) {
-      this.pasteSessionId = this.session.getSessionId();
-      this.pasteConnectionEpoch = this.session.getConnectionEpoch();
-      this.pasteInputEpoch = this.session.input.getInputEpoch();
+      this.pendingPaste = new PasteRequestContext(this.session.getSessionId(),
+        this.session.getConnectionEpoch(), this.session.input.getInputEpoch());
       this.showPasteAuthorization = true;
     }
   }
@@ -152,7 +153,7 @@ struct Index {
       const started = this.session.connect(this.host, port, this.username, this.password);
       if (started) {
         this.imeMode = false;
-        this.showPasteAuthorization = false;
+        this.cancelPasteRequest();
       }
     } finally {
       this.password = '';
@@ -193,19 +194,33 @@ struct Index {
       });
   }
 
-  private isPasteContextCurrent(): boolean {
-    return this.snapshot.inputEnabled && this.pasteSessionId === this.session.getSessionId() &&
-      this.pasteConnectionEpoch === this.session.getConnectionEpoch() &&
-      this.pasteInputEpoch === this.session.input.getInputEpoch();
+  private cancelPasteRequest(): void {
+    this.pendingPaste = null;
+    this.showPasteAuthorization = false;
+  }
+
+  private isPasteContextCurrent(request: PasteRequestContext): boolean {
+    return this.snapshot.inputEnabled && this.pendingPaste === request &&
+      request.sessionId === this.session.getSessionId() &&
+      request.connectionEpoch === this.session.getConnectionEpoch() &&
+      request.inputEpoch === this.session.input.getInputEpoch();
+  }
+
+  private submitPaste(text: string, request: PasteRequestContext): void {
+    if (this.isPasteContextCurrent(request)) {
+      this.cancelPasteRequest();
+      this.session.paste(text, request.sessionId, request.connectionEpoch, request.inputEpoch);
+    }
   }
 
   private readPasteboard(): void {
-    if (!this.isPasteContextCurrent()) {
+    const request = this.pendingPaste;
+    if (request === null || !this.isPasteContextCurrent(request)) {
       return;
     }
     pasteboard.getSystemPasteboard().getData()
       .then((data: pasteboard.PasteData): void => {
-        if (!this.isPasteContextCurrent()) {
+        if (!this.isPasteContextCurrent(request)) {
           return;
         }
         const text = data.getPrimaryText();
@@ -224,23 +239,35 @@ struct Index {
             title: '确认粘贴',
             message: `${bytes} 字节，可能包含多行命令。\n\n${preview}`,
             autoCancel: true,
+            cancel: (): void => {
+              if (this.pendingPaste === request) {
+                this.cancelPasteRequest();
+              }
+            },
             primaryButton: {
               value: '取消',
-              action: (): void => {}
+              action: (): void => {
+                if (this.pendingPaste === request) {
+                  this.cancelPasteRequest();
+                }
+              }
             },
             secondaryButton: {
               value: '粘贴',
               action: (): void => {
-                this.session.paste(text, this.pasteSessionId, this.pasteConnectionEpoch, this.pasteInputEpoch);
+                this.submitPaste(text, request);
               }
             }
           });
         } else {
-          this.session.paste(text, this.pasteSessionId, this.pasteConnectionEpoch, this.pasteInputEpoch);
+          this.submitPaste(text, request);
         }
       })
       .catch((error: BusinessError): void => {
-        this.showToast(`无法读取剪贴板：${error.message}`);
+        if (this.isPasteContextCurrent(request)) {
+          this.cancelPasteRequest();
+          this.showToast(`无法读取剪贴板：${error.message}`);
+        }
       });
   }
 
@@ -299,12 +326,12 @@ struct Index {
             this.session.setImeMode(false);
           }
         })
-      Button(this.snapshot.inputEnabled ? '断开' : '连接')
+      Button(this.snapshot.state === ConnectionState.OPEN ? '断开' : '连接')
         .fontSize(11)
         .height(28)
         .margin({ left: 4 })
         .onClick((): void => {
-          if (this.snapshot.inputEnabled) {
+          if (this.snapshot.state === ConnectionState.OPEN) {
             this.session.disconnect();
             this.showConnect = true;
           } else {
@@ -333,6 +360,7 @@ struct Index {
               if (result === PasteButtonOnClickResult.SUCCESS) {
                 this.readPasteboard();
               } else {
+                this.cancelPasteRequest();
                 this.showToast('未获得剪贴板授权');
               }
             })
@@ -340,7 +368,7 @@ struct Index {
         .margin({ bottom: 12 })
         Button('取消')
           .onClick((): void => {
-            this.showPasteAuthorization = false;
+            this.cancelPasteRequest();
           })
       }
       .width('80%')
@@ -422,7 +450,7 @@ struct Index {
               if (!this.snapshot.terminalReady) {
                 this.password = '';
                 this.imeMode = false;
-                this.showPasteAuthorization = false;
+                this.cancelPasteRequest();
                 this.session.recoverTerminal();
               } else {
                 this.connect();

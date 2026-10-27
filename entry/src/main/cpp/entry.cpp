@@ -1,4 +1,4 @@
-#include "session.h"
+#include "session_registry.h"
 
 #include <napi/native_api.h>
 
@@ -9,7 +9,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -21,7 +20,17 @@ constexpr size_t kMaxInputBytes = 64 * 1024;
 
 void DispatchEvent(napi_env env, napi_value callback, void *context, void *data);
 
-class Manager final : public NativeEventSink {
+class Manager final {
+    class GenerationSink final : public NativeEventSink {
+    public:
+        GenerationSink(Manager &manager, uint64_t generation) : manager_(manager), generation_(generation) {}
+        bool Emit(std::unique_ptr<NativeEvent> event) override {
+            return manager_.Emit(generation_, std::move(event));
+        }
+    private:
+        Manager &manager_;
+        uint64_t generation_;
+    };
 public:
     static Manager &Instance() {
         static Manager manager;
@@ -54,46 +63,32 @@ public:
             }
             cleanupEnv_ = env;
         }
+        registry_.CloseAll();
         napi_threadsafe_function oldCallback = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             disposed_ = false;
+            ++callbackGeneration_;
             oldCallback = callback_;
             callback_ = newCallback;
         }
         if (oldCallback != nullptr) {
-            napi_release_threadsafe_function(oldCallback, napi_tsfn_release);
+            napi_release_threadsafe_function(oldCallback, napi_tsfn_abort);
         }
         return true;
     }
 
     void Dispose() {
         std::lock_guard<std::mutex> operationLock(operationMutex_);
-        std::vector<std::shared_ptr<Session>> sessions;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (disposed_ && sessions_.empty() && callback_ == nullptr) {
-                return;
-            }
-            disposed_ = true;
-            sessions.reserve(sessions_.size());
-            for (const auto &entry : sessions_) {
-                sessions.push_back(entry.second);
-            }
-        }
-        for (const auto &session : sessions) {
-            session->RequestClose();
-        }
-        for (const auto &session : sessions) {
-            session->Stop();
-        }
         napi_threadsafe_function oldCallback = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            sessions_.clear();
+            disposed_ = true;
+            ++callbackGeneration_;
             oldCallback = callback_;
             callback_ = nullptr;
         }
+        registry_.CloseAll();
         if (oldCallback != nullptr) {
             napi_release_threadsafe_function(oldCallback, napi_tsfn_abort);
         }
@@ -101,66 +96,16 @@ public:
 
     bool Connect(std::unique_ptr<NativeConnectOptions> options, std::string &error) {
         std::lock_guard<std::mutex> operationLock(operationMutex_);
-        std::shared_ptr<Session> previous;
+        uint64_t generation;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (disposed_ || callback_ == nullptr) {
                 error = "native SSH is not initialized";
                 return false;
             }
-            auto found = sessions_.find(options->sessionId);
-            if (found != sessions_.end()) {
-                previous = found->second;
-            }
+            generation = callbackGeneration_;
         }
-        if (previous != nullptr) {
-            if (options->connectionEpoch <= previous->Epoch()) {
-                error = "connectionEpoch must increase when reconnecting a session";
-                return false;
-            }
-            previous->RequestClose();
-            previous->Stop();
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto found = sessions_.find(options->sessionId);
-            if (found != sessions_.end() && found->second == previous) {
-                sessions_.erase(found);
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            size_t active = 0;
-            for (const auto &entry : sessions_) {
-                if (entry.second->IsActive()) {
-                    ++active;
-                }
-            }
-            if (active >= 4) {
-                error = "the four-session limit has been reached";
-                return false;
-            }
-        }
-        std::shared_ptr<Session> session;
-        try {
-            session = std::make_shared<Session>(std::move(options), *this);
-        } catch (...) {
-            error = "could not allocate the native SSH session";
-            return false;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            sessions_[session->Id()] = session;
-        }
-        try {
-            session->Start();
-        } catch (...) {
-            session->RequestClose();
-            session->Stop();
-            std::lock_guard<std::mutex> lock(mutex_);
-            sessions_.erase(session->Id());
-            error = "could not start the native SSH worker";
-            return false;
-        }
-        return true;
+        return registry_.Connect(std::move(options), std::make_shared<GenerationSink>(*this, generation), error);
     }
 
     std::shared_ptr<Session> Find(const std::string &sessionId, uint64_t connectionEpoch) {
@@ -168,31 +113,17 @@ public:
         if (disposed_) {
             return nullptr;
         }
-        auto found = sessions_.find(sessionId);
-        if (found == sessions_.end() || found->second->Epoch() != connectionEpoch) {
-            return nullptr;
-        }
-        return found->second;
+        return registry_.Find(sessionId, connectionEpoch);
     }
 
     void Close(const std::string &sessionId, uint64_t connectionEpoch) {
         std::lock_guard<std::mutex> operationLock(operationMutex_);
-        auto session = Find(sessionId, connectionEpoch);
-        if (session == nullptr) {
-            return;
-        }
-        session->RequestClose();
-        session->Stop();
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = sessions_.find(sessionId);
-        if (found != sessions_.end() && found->second == session) {
-            sessions_.erase(found);
-        }
+        registry_.Close(sessionId, connectionEpoch);
     }
 
-    bool Emit(std::unique_ptr<NativeEvent> event) override {
+    bool Emit(uint64_t generation, std::unique_ptr<NativeEvent> event) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (disposed_ || callback_ == nullptr) {
+        if (disposed_ || callback_ == nullptr || generation != callbackGeneration_) {
             return false;
         }
         napi_status status = napi_call_threadsafe_function(callback_, event.get(), napi_tsfn_nonblocking);
@@ -213,10 +144,12 @@ private:
 
     std::mutex operationMutex_;
     std::mutex mutex_;
-    std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
     napi_threadsafe_function callback_ = nullptr;
     napi_env cleanupEnv_ = nullptr;
     bool disposed_ = true;
+    uint64_t callbackGeneration_ = 0;
+    // Declared last so workers are joined before their event sink is destroyed.
+    SessionRegistry registry_;
 };
 
 bool SetString(napi_env env, napi_value object, const char *name, const std::string &value) {

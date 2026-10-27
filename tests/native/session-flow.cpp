@@ -12,6 +12,20 @@
 using namespace hterminal;
 using Clock = std::chrono::steady_clock;
 
+static std::atomic<bool> deferStdoutSample{false};
+extern "C" int __real_ssh_channel_poll(ssh_channel channel, int stream);
+extern "C" int __wrap_ssh_channel_poll(ssh_channel channel, int stream) {
+    int result = __real_ssh_channel_poll(channel, stream);
+    if (stream == 0 && result > 0 && deferStdoutSample.load() &&
+        __real_ssh_channel_poll(channel, 1) == SSH_EOF) {
+        // Model stdout sampled empty just before the stderr poll processes
+        // the final stdout packet and EOF. Data remains in the real buffer.
+        deferStdoutSample.store(false);
+        return 0;
+    }
+    return result;
+}
+
 struct PendingAck {
     uint64_t generation;
     uint64_t seq;
@@ -30,6 +44,8 @@ public:
     size_t controlConsumed = 0;
     int ackDelayMs = 0;
     bool opened = false;
+    bool closed = false;
+    std::string command = "burst\r";
 
     bool Emit(std::unique_ptr<NativeEvent> event) override {
         if (event->type == NativeEventType::HostKey) {
@@ -42,11 +58,12 @@ public:
                 opened = true;
                 openedAt = Clock::now();
             }
-            const std::string command = "burst\r";
             return session->WriteInput(1, "burst", {command.begin(), command.end()});
         }
         std::lock_guard<std::mutex> lock(mutex);
-        if (event->type == NativeEventType::Error) {
+        if (event->type == NativeEventType::State && event->state == "CLOSED") {
+            closed = true;
+        } else if (event->type == NativeEventType::Error) {
             failure = event->message;
         } else if (event->type == NativeEventType::Output) {
             std::vector<unsigned char> decoded(event->data.size() / 4 * 3);
@@ -66,9 +83,15 @@ public:
     }
 };
 
-static bool RunCase(const char *filesDir, const char *host, unsigned int port, int delayMs, int pauseMs) {
+static bool RunCase(const char *filesDir, const char *host, unsigned int port, int delayMs, int pauseMs,
+                    const std::string &commandName = "burst") {
     FlowSink sink;
     sink.ackDelayMs = delayMs;
+    sink.command = commandName + "\r";
+    bool terminalClose = commandName != "burst";
+    bool expectedError = commandName == "disconnect";
+    bool checkControl = pauseMs > 0 && !terminalClose;
+    deferStdoutSample.store(commandName == "late-tail");
     auto options = std::make_unique<NativeConnectOptions>();
     options->sessionId = "flow-test";
     options->connectionEpoch = 1;
@@ -81,9 +104,10 @@ static bool RunCase(const char *filesDir, const char *host, unsigned int port, i
     options->cols = 80;
     options->rows = 24;
     sink.session = std::make_shared<Session>(std::move(options), sink);
-    std::string expected = "READY\r\n" + std::string(4 * 1024 * 1024, 'X') + "\r\nEND\r\n";
+    std::string expected = "READY\r\n" + std::string(terminalClose ? 512 * 1024 : 4 * 1024 * 1024,
+        commandName == "stderr-close" ? 'E' : 'X') + "\r\nEND\r\n";
     const std::string control = "control\r";
-    if (pauseMs > 0) {
+    if (checkControl) {
         expected += "\r\nCONTROL\r\n";
     }
     sink.session->Start();
@@ -97,6 +121,7 @@ static bool RunCase(const char *filesDir, const char *host, unsigned int port, i
         {
             std::lock_guard<std::mutex> lock(sink.mutex);
             if (!sink.failure.empty()) {
+                passed = expectedError && sink.output == expected;
                 break;
             }
             auto now = Clock::now();
@@ -104,12 +129,12 @@ static bool RunCase(const char *filesDir, const char *host, unsigned int port, i
             if (pauseMs > 0 && sink.opened && elapsed >= pauseMs / 2 && !checkedPause) {
                 checkedPause = true;
                 if (!sink.session->IsActive() || sink.output.empty() || sink.output.size() > 256 * 1024 ||
-                    sink.controlConsumed != control.size()) {
+                    (checkControl && sink.controlConsumed != control.size())) {
                     sink.failure = "paused consumer lost boundedness, connectivity, or input progress";
                     break;
                 }
             }
-            if (pauseMs > 0 && sink.opened && elapsed >= 500 && !sentControl) {
+            if (checkControl && sink.opened && elapsed >= 500 && !sentControl) {
                 sentControl = true;
                 sendControl = true;
             }
@@ -119,9 +144,9 @@ static bool RunCase(const char *filesDir, const char *host, unsigned int port, i
                     sink.acks.pop_front();
                 }
             }
-            if (sink.output.size() >= expected.size()) {
+            if (sink.output.size() >= expected.size() && (!terminalClose || sink.closed)) {
                 passed = checkedPause && sink.output == expected &&
-                    (pauseMs == 0 || sink.controlConsumed == control.size());
+                    (!checkControl || sink.controlConsumed == control.size()) && !expectedError;
                 break;
             }
         }
@@ -137,8 +162,9 @@ static bool RunCase(const char *filesDir, const char *host, unsigned int port, i
     }
     sink.session->RequestClose();
     sink.session->Stop();
-    printf("%s: ACK delay=%dms pause=%dms output=%zu/%zu control=%zu %s\n",
-        passed ? "PASS" : "FAIL", delayMs, pauseMs, sink.output.size(), expected.size(),
+    passed = passed && !deferStdoutSample.load();
+    printf("%s: %s ACK delay=%dms pause=%dms output=%zu/%zu control=%zu %s\n",
+        passed ? "PASS" : "FAIL", commandName.c_str(), delayMs, pauseMs, sink.output.size(), expected.size(),
         sink.controlConsumed, sink.failure.c_str());
     return passed;
 }
@@ -152,5 +178,12 @@ int main(int argc, char **argv) {
     bool immediate = RunCase(argv[1], argv[2], port, 0, 0);
     bool delayed = RunCase(argv[1], argv[2], port, 100, 0);
     bool paused = RunCase(argv[1], argv[2], port, 0, 2000);
-    return immediate && delayed && paused ? 0 : 1;
+    bool closeImmediate = RunCase(argv[1], argv[2], port, 0, 0, "close");
+    bool closeDelayed = RunCase(argv[1], argv[2], port, 100, 0, "close");
+    bool closePaused = RunCase(argv[1], argv[2], port, 0, 2000, "close");
+    bool stderrClose = RunCase(argv[1], argv[2], port, 100, 0, "stderr-close");
+    bool disconnected = RunCase(argv[1], argv[2], port, 100, 0, "disconnect");
+    bool lateTail = RunCase(argv[1], argv[2], port, 100, 0, "late-tail");
+    return immediate && delayed && paused && closeImmediate && closeDelayed && closePaused &&
+        stderrClose && disconnected && lateTail ? 0 : 1;
 }

@@ -1,0 +1,119 @@
+--- a/src/channels.c
++++ b/src/channels.c
+@@ -3179,7 +3179,7 @@
+     ssh_buffer stdbuf = NULL;
+     uint32_t len;
+     struct ssh_channel_read_termination_struct ctx;
+-    int rc;
++    int rc = SSH_OK;
+ 
+     if (channel == NULL) {
+         return SSH_ERROR;
+@@ -3216,28 +3216,29 @@
+         timeout_ms = SSH_TIMEOUT_INFINITE;
+     }
+ 
+-    rc = ssh_handle_packets_termination(session,
+-                                        timeout_ms,
+-                                        ssh_channel_read_termination,
+-                                        &ctx);
+-    if (rc == SSH_ERROR || rc == SSH_AGAIN) {
+-        return rc;
+-    }
+-
+-    /*
+-     * If the channel is closed or in an error state, reading from it is an
+-     * error
+-     */
+-    if (session->session_state == SSH_SESSION_STATE_ERROR) {
+-        return SSH_ERROR;
+-    }
+-    /* If the server closed the channel properly, there is nothing to do */
+-    if (channel->remote_eof && ssh_buffer_get_len(stdbuf) == 0) {
+-        return 0;
+-    }
+-    if (channel->state == SSH_CHANNEL_STATE_CLOSED) {
+-        ssh_set_error(session, SSH_FATAL, "Remote channel is closed.");
+-        return SSH_ERROR;
++    /* H-Terminal: deliver already authenticated buffered bytes before a
++     * terminal transport/channel status. Processing later packets here can
++     * otherwise turn a valid final read into SSH_ERROR on disconnect. */
++    if (ssh_buffer_get_len(stdbuf) == 0) {
++        rc = ssh_handle_packets_termination(session,
++                                            timeout_ms,
++                                            ssh_channel_read_termination,
++                                            &ctx);
++    }
++    if (ssh_buffer_get_len(stdbuf) == 0) {
++        if (rc == SSH_ERROR || rc == SSH_AGAIN) {
++            return rc;
++        }
++        if (session->session_state == SSH_SESSION_STATE_ERROR) {
++            return SSH_ERROR;
++        }
++        if (channel->remote_eof && ssh_buffer_get_len(stdbuf) == 0) {
++            return 0;
++        }
++        if (channel->state == SSH_CHANNEL_STATE_CLOSED) {
++            ssh_set_error(session, SSH_FATAL, "Remote channel is closed.");
++            return SSH_ERROR;
++        }
+     }
+     len = ssh_buffer_get_len(stdbuf);
+     /* Read count bytes if len is greater, everything otherwise */
+@@ -3252,9 +3253,11 @@
+         channel->state = SSH_CHANNEL_STATE_CLOSED;
+     }
+ 
+-    rc = grow_window(session, channel);
+-    if (rc == SSH_ERROR) {
+-        return -1;
++    /* A successful copy must not be hidden by a failed window update.
++     * The next read/poll will expose any transport error after buffers drain. */
++    if (!channel->remote_eof && channel->state == SSH_CHANNEL_STATE_OPEN &&
++        ssh_is_connected(session)) {
++        (void)grow_window(session, channel);
+     }
+ 
+     return len;
+@@ -3343,6 +3346,7 @@
+ int ssh_channel_poll(ssh_channel channel, int is_stderr)
+ {
+   ssh_buffer stdbuf;
++  int rc = SSH_OK;
+ 
+   if ((channel == NULL) || (channel->flags & SSH_CHANNEL_FLAG_FREED_LOCAL)) {
+       return SSH_ERROR;
+@@ -3352,15 +3356,18 @@
+ 
+   if (is_stderr) {
+     stdbuf = channel->stderr_buffer;
++  }
++
++  /* H-Terminal: buffered data precedes EOF/error, including on stderr. */
++  if (ssh_buffer_get_len(stdbuf) > 0) {
++    return ssh_buffer_get_len(stdbuf);
+   }
+ 
+   if (channel->remote_eof == 0) {
+     if (channel->session->session_state == SSH_SESSION_STATE_ERROR){
+       return SSH_ERROR;
+     }
+-    if (ssh_handle_packets(channel->session, SSH_TIMEOUT_NONBLOCKING)==SSH_ERROR) {
+-      return SSH_ERROR;
+-    }
++    rc = ssh_handle_packets(channel->session, SSH_TIMEOUT_NONBLOCKING);
+   }
+ 
+   if (ssh_buffer_get_len(stdbuf) > 0){
+@@ -3369,6 +3376,10 @@
+ 
+   if (channel->remote_eof) {
+     return SSH_EOF;
++  }
++
++  if (rc == SSH_ERROR) {
++    return SSH_ERROR;
+   }
+ 
+   return ssh_buffer_get_len(stdbuf);
