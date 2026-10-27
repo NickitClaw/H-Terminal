@@ -17,6 +17,12 @@
 
 namespace hterminal {
 
+bool EnsureSshInitialized();
+bool SupportedPrivateKeyContainer(const std::string &key);
+struct TrustedHostKey { std::string publicKey; std::string fingerprint; };
+bool AccessTrustedHostKey(const std::string &filesDir, const std::string &host, uint32_t port,
+                         const std::string &expectedFingerprint, bool remove, TrustedHostKey &result);
+
 class Session final : public std::enable_shared_from_this<Session> {
 public:
     Session(std::unique_ptr<NativeConnectOptions> options, NativeEventSink &sink);
@@ -29,8 +35,12 @@ public:
     void Start();
     void Stop();
     void RequestClose();
+    void Probe(uint64_t requestId);
     void TrustDecision(bool accepted);
-    bool WriteInput(uint64_t inputEpoch, const std::string &eventId, std::vector<uint8_t> data);
+    void AnswerAuthentication(uint64_t requestId, std::vector<std::string> answers);
+    bool WriteInput(uint64_t inputEpoch, const std::string &eventId, std::vector<uint8_t> data,
+                    InputKind kind = InputKind::Normal, const std::string &pasteId = "");
+    void ResetInput(uint64_t inputEpoch, bool sendControl);
     void Resize(int cols, int rows);
     void Acknowledge(uint64_t terminalGeneration, uint64_t seq, size_t byteLength);
 
@@ -54,6 +64,7 @@ private:
         VerifyHost,
         WaitTrust,
         Authenticate,
+        WaitAuth,
         OpenChannel,
         RequestPty,
         RequestShell,
@@ -67,9 +78,17 @@ private:
         Resize,
         Acknowledge,
         Input,
+        Probe,
+        ResetInput,
+        AuthAnswer,
     };
 
     struct Command {
+        Command() = default;
+        Command(Command &&) = default;
+        Command &operator=(Command &&) = default;
+        Command(const Command &) = delete;
+        ~Command() { for (auto &answer : answers) SecureClear(answer); }
         CommandType type = CommandType::Close;
         bool accepted = false;
         int cols = 0;
@@ -79,6 +98,8 @@ private:
         uint64_t inputEpoch = 0;
         std::string eventId;
         std::vector<uint8_t> data;
+        InputKind kind = InputKind::Normal;
+        std::vector<std::string> answers;
     };
 
     struct InputChunk {
@@ -86,6 +107,7 @@ private:
         std::string eventId;
         size_t offset = 0;
         std::vector<uint8_t> data;
+        InputKind kind = InputKind::Normal;
     };
 
     struct UnackedFrame {
@@ -100,6 +122,7 @@ private:
     void AdvanceConnect();
     void AdvanceVerifyHost();
     void AdvanceAuthenticate();
+    void RequestAuthenticationAnswers();
     void AdvanceOpenChannel();
     void AdvanceRequestPty();
     void AdvanceRequestShell();
@@ -115,9 +138,11 @@ private:
     void ApplyCommand(Command &command);
     void ApplyAcknowledge(uint64_t seq, size_t byteLength);
     void ProcessInput();
+    void ApplyInputReset(uint64_t epoch, bool sendControl);
     void DiscardInput(InputChunk &input);
     void ClearInput();
     void ProcessResize();
+    void ProcessProbe();
     void PollOutput();
     void ReadOutputStream(int stream, size_t &available);
     bool EmitOutput(const uint8_t *data, size_t length);
@@ -137,6 +162,12 @@ private:
     std::atomic<bool> trustPending_{false};
     std::atomic<bool> trustQueued_{false};
     std::atomic<bool> hasInputEpoch_{false};
+    std::atomic<bool> inputResetPending_{false};
+    bool inputResetApplied_ = false;
+    uint64_t lastResetEpoch_ = 0;
+    std::string acceptedPasteId_;
+    bool acceptedPasteBrackets_ = false;
+    bool pasteOpened_ = false;
     std::atomic<uint64_t> latestInputEpoch_{0};
 
     mutable std::mutex commandMutex_;
@@ -151,6 +182,12 @@ private:
     ssh_session session_ = nullptr;
     ssh_channel channel_ = nullptr;
     ssh_event event_ = nullptr;
+    ssh_key privateKey_ = nullptr;
+    size_t authStep_ = 0;
+    size_t authRounds_ = 0;
+    std::atomic<uint64_t> challengeId_{0};
+    std::atomic<bool> answerQueued_{false};
+    size_t promptCount_ = 0;
     Stage stage_ = Stage::Connect;
     std::chrono::steady_clock::time_point deadline_{};
     bool handshakeDeadlineStarted_ = false;
@@ -175,6 +212,9 @@ private:
     uint64_t nextSeq_ = 1;
     bool remoteEof_ = false;
     bool transportError_ = false;
+    uint64_t pendingProbeId_ = 0;
+    uint64_t activeProbeId_ = 0;
+    std::chrono::steady_clock::time_point probeDeadline_{};
 };
 
 } // namespace hterminal

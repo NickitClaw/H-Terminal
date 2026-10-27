@@ -17,3 +17,6 @@ local.properties
 *.hap
 *.app
 *.log
+__pycache__/
+*.py[cod]
+entry/src/main/ets/entryability/testing/DeviceProbe.ets

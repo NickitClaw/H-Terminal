@@ -10,6 +10,11 @@
 #include <mutex>
 #include <new>
 #include <poll.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <openssl/evp.h>
+#include <string_view>
 #include <utility>
 
 namespace hterminal {
@@ -67,6 +72,148 @@ std::string Base64(const uint8_t *data, size_t length) {
 
 } // namespace
 
+bool EnsureSshInitialized() {
+    std::call_once(g_sshInitFlag, []() { g_sshInitResult = ssh_init(); });
+    return g_sshInitResult == SSH_OK;
+}
+
+bool SupportedPrivateKeyContainer(const std::string &key) {
+    // Bound work before libssh enters bcrypt_pbkdf. The container is user
+    // supplied and its round count must not monopolize a worker indefinitely.
+    constexpr char header[] = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    constexpr char footer[] = "-----END OPENSSH PRIVATE KEY-----";
+    if (key.size() > 65536 || key.compare(0, sizeof(header) - 1, header) != 0) return false;
+    size_t end = key.find(footer, sizeof(header) - 1);
+    if (end == std::string::npos) return false;
+    struct Encoded {
+        std::string value;
+        ~Encoded() { SecureClear(value); }
+    } encoded;
+    for (size_t i = sizeof(header) - 1; i < end; ++i) {
+        unsigned char c = key[i];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '+' || c == '/' || c == '=')) return false;
+        encoded.value.push_back(static_cast<char>(c));
+    }
+    if (encoded.value.empty() || encoded.value.size() % 4 != 0) return false;
+    struct Decoded {
+        std::vector<unsigned char> value;
+        ~Decoded() { volatile unsigned char *p = value.data(); for (size_t i = 0; i < value.size(); ++i) p[i] = 0; }
+    } decoded;
+    decoded.value.resize(encoded.value.size() / 4 * 3);
+    int count = EVP_DecodeBlock(decoded.value.data(), reinterpret_cast<const unsigned char *>(encoded.value.data()),
+        static_cast<int>(encoded.value.size()));
+    if (count < 0) return false;
+    constexpr char magic[] = "openssh-key-v1";
+    if (decoded.value.size() < sizeof(magic) || memcmp(decoded.value.data(), magic, sizeof(magic)) != 0) return false;
+    size_t offset = sizeof(magic);
+    auto readInteger = [&](uint32_t &value) {
+        if (offset + 4 > decoded.value.size()) return false;
+        const unsigned char *p = decoded.value.data() + offset;
+        value = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+            (static_cast<uint32_t>(p[2]) << 8) | p[3];
+        offset += 4;
+        return true;
+    };
+    auto readString = [&](std::string_view &value) {
+        uint32_t size = 0;
+        if (!readInteger(size) || size > decoded.value.size() - offset) return false;
+        value = std::string_view(reinterpret_cast<const char *>(decoded.value.data() + offset), size);
+        offset += size;
+        return true;
+    };
+    std::string_view cipher, kdf, options;
+    uint32_t keys = 0;
+    if (!readString(cipher) || cipher.size() > 64 || !readString(kdf) || !readString(options) ||
+        !readInteger(keys) || keys != 1) return false;
+    if (cipher == "none") return kdf == "none" && options.empty();
+    if (kdf != "bcrypt" || options.size() < 8 || options.size() > 72) return false;
+    const auto *p = reinterpret_cast<const unsigned char *>(options.data());
+    uint32_t salt = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+        (static_cast<uint32_t>(p[2]) << 8) | p[3];
+    if (salt < 16 || salt > 64 || options.size() != salt + 8) return false;
+    p += salt + 4;
+    uint32_t rounds = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+        (static_cast<uint32_t>(p[2]) << 8) | p[3];
+    return rounds > 0 && rounds <= 1024;
+}
+
+bool AccessTrustedHostKey(const std::string &filesDir, const std::string &host, uint32_t port,
+                         const std::string &expectedFingerprint, bool remove, TrustedHostKey &result) {
+    if (!EnsureSshInitialized()) return false;
+    std::lock_guard<std::mutex> lock(g_knownHostsMutex);
+    const std::string file = filesDir + "/known_hosts";
+    struct Descriptor {
+        int value;
+        ~Descriptor() { if (value >= 0) close(value); }
+    } input{open(file.c_str(), O_RDONLY | O_NOFOLLOW)};
+    struct stat status{};
+    if (input.value < 0 || fstat(input.value, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size > 1024 * 1024) return false;
+    std::string contents(static_cast<size_t>(status.st_size), '\0');
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        ssize_t count = read(input.value, &contents[offset], contents.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        offset += static_cast<size_t>(count);
+    }
+    const std::string target = port == 22 ? host : "[" + host + "]:" + std::to_string(port);
+    bool found = false;
+    bool sharedRecord = false;
+    std::string kept;
+    for (size_t begin = 0; begin < contents.size();) {
+        size_t end = contents.find('\n', begin);
+        if (end == std::string::npos) end = contents.size();
+        const std::string line = contents.substr(begin, end - begin);
+        ssh_knownhosts_entry *entry = nullptr;
+        bool erase = false;
+        if (!line.empty() && ssh_known_hosts_parse_line(target.c_str(), line.c_str(), &entry) == SSH_OK && entry) {
+            unsigned char *hash = nullptr;
+            size_t length = 0;
+            char *fingerprint = nullptr, *publicKey = nullptr;
+            if (ssh_get_publickey_hash(entry->publickey, SSH_PUBLICKEY_HASH_SHA256, &hash, &length) == SSH_OK) {
+                fingerprint = ssh_get_fingerprint_hash(SSH_PUBLICKEY_HASH_SHA256, hash, length);
+            }
+            if (fingerprint && (!remove || expectedFingerprint == fingerprint)) {
+                if (ssh_pki_export_pubkey_base64(entry->publickey, &publicKey) == SSH_OK && publicKey) {
+                    result.publicKey = std::string(ssh_key_type_to_char(ssh_key_type(entry->publickey))) + " " + publicKey;
+                    result.fingerprint = fingerprint;
+                    found = true;
+                    const std::string names = line.substr(0, line.find_first_of(" \t"));
+                    // Never erase a shared alias/wildcard line on behalf of one host.
+                    erase = remove && names.find(',') == std::string::npos && names.find('*') == std::string::npos &&
+                        names.find('?') == std::string::npos;
+                    if (remove && !erase) sharedRecord = true;
+                }
+            }
+            if (hash) ssh_clean_pubkey_hash(&hash);
+            if (fingerprint) ssh_string_free_char(fingerprint);
+            if (publicKey) ssh_string_free_char(publicKey);
+        }
+        if (entry) ssh_knownhosts_entry_free(entry);
+        if (!erase) { kept += line; kept += '\n'; }
+        begin = end + 1;
+        if (found && !remove) return true;
+    }
+    if (!found || !remove || sharedRecord) return false;
+    std::string temporary = file + ".XXXXXX";
+    std::vector<char> path(temporary.begin(), temporary.end()); path.push_back('\0');
+    Descriptor output{mkstemp(path.data())};
+    if (output.value < 0) return false;
+    offset = 0;
+    bool ok = true;
+    while (offset < kept.size()) {
+        ssize_t count = write(output.value, kept.data() + offset, kept.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ok = false; break; }
+        offset += static_cast<size_t>(count);
+    }
+    ok = ok && fsync(output.value) == 0 && rename(path.data(), file.c_str()) == 0;
+    if (!ok) unlink(path.data());
+    return ok;
+}
+
 Session::Session(std::unique_ptr<NativeConnectOptions> options, NativeEventSink &sink)
     : options_(std::move(options)), sink_(sink), cols_(options_->cols), rows_(options_->rows) {}
 
@@ -77,6 +224,19 @@ Session::Session(std::unique_ptr<NativeConnectOptions> options, std::shared_ptr<
 Session::~Session() {
     Stop();
     SecureClear(options_->password);
+}
+
+void Session::AnswerAuthentication(uint64_t requestId, std::vector<std::string> answers) {
+    if (requestId != challengeId_.load() || closeRequested_.load() || answerQueued_.exchange(true)) {
+        for (auto &answer : answers) SecureClear(answer);
+        return;
+    }
+    Command command;
+    command.type = CommandType::AuthAnswer;
+    command.seq = requestId;
+    command.answers = std::move(answers);
+    std::lock_guard<std::mutex> lock(commandMutex_);
+    commands_.push_back(std::move(command));
 }
 
 const std::string &Session::Id() const {
@@ -116,6 +276,16 @@ void Session::RequestClose() {
     closeRequested_.store(true, std::memory_order_release);
 }
 
+void Session::Probe(uint64_t requestId) {
+    if (requestId == 0 || !IsActive() || closeRequested_.load()) return;
+    acceptingInput_.store(false, std::memory_order_release);
+    Command command;
+    command.type = CommandType::Probe;
+    command.seq = requestId;
+    std::lock_guard<std::mutex> lock(commandMutex_);
+    commands_.push_back(std::move(command));
+}
+
 void Session::TrustDecision(bool accepted) {
     if (!trustPending_.load(std::memory_order_acquire) || closeRequested_.load(std::memory_order_acquire)) {
         return;
@@ -135,15 +305,25 @@ void Session::TrustDecision(bool accepted) {
     }
 }
 
-bool Session::WriteInput(uint64_t inputEpoch, const std::string &eventId, std::vector<uint8_t> data) {
-    if (data.empty() || data.size() > kInputQueueLimit || !IsOpenForInput()) {
+bool Session::WriteInput(uint64_t inputEpoch, const std::string &eventId, std::vector<uint8_t> data,
+                         InputKind kind, const std::string &pasteId) {
+    if ((data.empty() && kind != InputKind::PasteStart && kind != InputKind::PasteEnd) ||
+        data.size() > kInputQueueLimit || !IsOpenForInput() || inputResetPending_.load()) {
         return false;
     }
     try {
         std::lock_guard<std::mutex> lock(commandMutex_);
-        if (!IsOpenForInput() || queuedInputBytes_ > kInputQueueLimit - data.size()) {
+        if (!IsOpenForInput() || inputResetPending_.load() || queuedInputBytes_ > kInputQueueLimit - data.size()) {
             return false;
         }
+        const std::vector<uint8_t> start{27, '[', '2', '0', '0', '~'};
+        const std::vector<uint8_t> end{27, '[', '2', '0', '1', '~'};
+        if (kind == InputKind::Normal && !acceptedPasteId_.empty()) return false;
+        if (kind == InputKind::PasteStart && (!acceptedPasteId_.empty() || pasteId.empty() ||
+            (!data.empty() && data != start))) return false;
+        if ((kind == InputKind::PasteData || kind == InputKind::PasteEnd) &&
+            (pasteId.empty() || pasteId != acceptedPasteId_)) return false;
+        if (kind == InputKind::PasteEnd && data != (acceptedPasteBrackets_ ? end : std::vector<uint8_t>{})) return false;
         if (hasInputEpoch_.load(std::memory_order_acquire) && inputEpoch < latestInputEpoch_.load(std::memory_order_acquire)) {
             return false;
         }
@@ -167,12 +347,30 @@ bool Session::WriteInput(uint64_t inputEpoch, const std::string &eventId, std::v
         command.inputEpoch = inputEpoch;
         command.eventId = eventId;
         command.data = std::move(data);
+        command.kind = kind;
         commands_.push_back(std::move(command));
         queuedInputBytes_ += commands_.back().data.size();
+        if (kind == InputKind::PasteStart) {
+            acceptedPasteId_ = pasteId;
+            acceptedPasteBrackets_ = !commands_.back().data.empty();
+        }
         return true;
     } catch (...) {
         return false;
     }
+}
+
+void Session::ResetInput(uint64_t epoch, bool sendControl) {
+    if (!IsActive() || closeRequested_.load()) return;
+    Command command;
+    command.type = CommandType::ResetInput;
+    command.inputEpoch = epoch;
+    command.accepted = sendControl;
+    std::lock_guard<std::mutex> lock(commandMutex_);
+    if (epoch <= lastResetEpoch_ || (hasInputEpoch_.load() && epoch <= latestInputEpoch_.load())) return;
+    commands_.push_back(std::move(command));
+    lastResetEpoch_ = epoch;
+    inputResetPending_.store(true, std::memory_order_release);
 }
 
 void Session::Resize(int cols, int rows) {
@@ -256,8 +454,7 @@ void Session::CheckDeadline(const char *message) {
 }
 
 bool Session::CreateTransport() {
-    std::call_once(g_sshInitFlag, []() { g_sshInitResult = ssh_init(); });
-    if (g_sshInitResult != SSH_OK) {
+    if (!EnsureSshInitialized()) {
         Fail("SSH library initialization failed");
         return false;
     }
@@ -301,6 +498,7 @@ bool Session::CreateTransport() {
 }
 
 void Session::DestroyTransport() {
+    if (privateKey_ != nullptr) { ssh_key_free(privateKey_); privateKey_ = nullptr; }
     if (event_ != nullptr) {
         if (session_ != nullptr) {
             ssh_event_remove_session(event_, session_);
@@ -357,6 +555,7 @@ void Session::Run() {
     ClearInput();
     DestroyTransport();
     SecureClear(options_->password);
+    SecureClear(options_->privateKey);
     stage_ = Stage::Finished;
     if (failed_) {
         state_.store(PublicState::Failed, std::memory_order_release);
@@ -385,6 +584,9 @@ void Session::Advance() {
             break;
         case Stage::Authenticate:
             AdvanceAuthenticate();
+            break;
+        case Stage::WaitAuth:
+            CheckDeadline("authentication prompt timed out");
             break;
         case Stage::OpenChannel:
             AdvanceOpenChannel();
@@ -478,6 +680,16 @@ void Session::AdvanceVerifyHost() {
         known = ssh_session_is_known_server(session_);
     }
     if (known == SSH_KNOWN_HOSTS_OK) {
+        auto identity = std::make_unique<NativeEvent>();
+        identity->type = NativeEventType::HostIdentity;
+        identity->sessionId = options_->sessionId;
+        identity->connectionEpoch = options_->connectionEpoch;
+        identity->host = options_->host;
+        identity->port = options_->port;
+        if (!DescribeHostKey(identity->keyType, identity->fingerprint) || !sink_.Emit(std::move(identity))) {
+            Fail("could not report verified host identity");
+            return;
+        }
         BeginAuthentication();
         return;
     }
@@ -527,17 +739,40 @@ void Session::AcceptHostKey() {
 }
 
 void Session::AdvanceAuthenticate() {
-    int result = ssh_userauth_password(session_, nullptr, options_->password.c_str());
+    const bool interactive = authStep_ > 0 || options_->authMethod == "keyboard-interactive";
+    int result;
+    if (interactive) {
+        result = ssh_userauth_kbdint(session_, nullptr, nullptr);
+    } else if (options_->authMethod.find("publickey") == 0) {
+        if (privateKey_ == nullptr) {
+            if (!SupportedPrivateKeyContainer(options_->privateKey)) {
+                Fail("unsupported OpenSSH private key container or excessive KDF cost"); return;
+            }
+            int imported = ssh_pki_import_privkey_base64(options_->privateKey.c_str(), options_->password.c_str(),
+                nullptr, nullptr, &privateKey_);
+            SecureClear(options_->privateKey);
+            SecureClear(options_->password);
+            if (imported != SSH_OK || privateKey_ == nullptr || ssh_key_type(privateKey_) != SSH_KEYTYPE_ED25519) {
+                Fail("invalid Ed25519 private key or passphrase");
+                return;
+            }
+        }
+        result = ssh_userauth_publickey(session_, nullptr, privateKey_);
+    } else {
+        result = ssh_userauth_password(session_, nullptr, options_->password.c_str());
+    }
+    if (result == SSH_AUTH_INFO && interactive) { RequestAuthenticationAnswers(); return; }
     if (result == SSH_AUTH_AGAIN) {
-        CheckDeadline("password authentication timed out");
+        CheckDeadline("SSH authentication timed out");
         return;
     }
     if (result == SSH_AUTH_SUCCESS) {
-        CheckDeadline("password authentication timed out");
+        CheckDeadline("SSH authentication timed out");
         if (failed_) {
             return;
         }
         SecureClear(options_->password);
+        if (privateKey_) { ssh_key_free(privateKey_); privateKey_ = nullptr; }
         channel_ = ssh_channel_new(session_);
         if (channel_ == nullptr) {
             Fail("could not allocate SSH channel");
@@ -547,12 +782,44 @@ void Session::AdvanceAuthenticate() {
         return;
     }
     if (result == SSH_AUTH_PARTIAL) {
-        Fail("server requires an additional authentication method");
+        if (privateKey_) { ssh_key_free(privateKey_); privateKey_ = nullptr; }
+        if (authStep_ == 0 && options_->authMethod.find("+keyboard-interactive") != std::string::npos) {
+            SecureClear(options_->password);
+            authStep_ = 1;
+            ChangeStage(Stage::Authenticate, kAuthenticationTimeout);
+        } else Fail("server requires an additional authentication method");
     } else if (result == SSH_AUTH_DENIED) {
-        Fail("password authentication was rejected");
+        Fail("SSH authentication was rejected");
     } else {
-        Fail("password authentication failed");
+        Fail("SSH authentication failed");
     }
+}
+
+void Session::RequestAuthenticationAnswers() {
+    int count = ssh_userauth_kbdint_getnprompts(session_);
+    if (count < 0 || count > 16 || ++authRounds_ > 32) { Fail("authentication prompt limit exceeded"); return; }
+    auto event = std::make_unique<NativeEvent>();
+    event->type = NativeEventType::AuthChallenge;
+    event->sessionId = options_->sessionId;
+    event->connectionEpoch = options_->connectionEpoch;
+    event->requestId = ++challengeId_;
+    const char *title = ssh_userauth_kbdint_getname(session_);
+    const char *instruction = ssh_userauth_kbdint_getinstruction(session_);
+    if ((title && strnlen(title, 4097) > 4096) || (instruction && strnlen(instruction, 4097) > 4096)) {
+        Fail("authentication prompt too large"); return;
+    }
+    event->title = title ? title : "";
+    event->instruction = instruction ? instruction : "";
+    for (int i = 0; i < count; ++i) {
+        char echo = 0;
+        const char *prompt = ssh_userauth_kbdint_getprompt(session_, static_cast<unsigned int>(i), &echo);
+        if (prompt == nullptr || strnlen(prompt, 4097) > 4096) { Fail("invalid authentication prompt"); return; }
+        event->prompts.push_back({prompt, echo != 0});
+    }
+    promptCount_ = static_cast<size_t>(count);
+    answerQueued_.store(false);
+    ChangeStage(Stage::WaitAuth, kTrustTimeout);
+    if (!sink_.Emit(std::move(event))) Fail("native event delivery failed");
 }
 
 void Session::AdvanceOpenChannel() {
@@ -660,6 +927,7 @@ void Session::DrainCommands() {
             input.inputEpoch = command.inputEpoch;
             input.eventId = command.eventId;
             input.data = std::move(command.data);
+            input.kind = command.kind;
             inputQueue_.push_back(std::move(input));
         } else {
             ApplyCommand(command);
@@ -704,6 +972,23 @@ void Session::ApplyCommand(Command &command) {
             break;
         case CommandType::Input:
             break;
+        case CommandType::Probe:
+            pendingProbeId_ = command.seq;
+            break;
+        case CommandType::ResetInput:
+            ApplyInputReset(command.inputEpoch, command.accepted);
+            break;
+        case CommandType::AuthAnswer:
+            if (stage_ == Stage::WaitAuth && command.seq == challengeId_.load() && command.answers.size() == promptCount_) {
+                CheckDeadline("authentication prompt timed out");
+                for (size_t i = 0; !failed_ && i < command.answers.size(); ++i) {
+                    if (ssh_userauth_kbdint_setanswer(session_, static_cast<unsigned int>(i), command.answers[i].c_str()) < 0) {
+                        Fail("could not submit authentication response");
+                    }
+                }
+                if (!failed_) ChangeStage(Stage::Authenticate, kAuthenticationTimeout);
+            }
+            break;
     }
 }
 
@@ -747,6 +1032,77 @@ void Session::ClearInput() {
     queuedInputBytes_ = 0;
     seenEventIds_.clear();
     eventIdOrder_.clear();
+    acceptedPasteId_.clear();
+    acceptedPasteBrackets_ = false;
+    pasteOpened_ = false;
+}
+
+void Session::ApplyInputReset(uint64_t epoch, bool sendControl) {
+    if (hasInputEpoch_.load() && epoch < latestInputEpoch_.load()) return;
+    if (inputResetApplied_) {
+        if (!inputQueue_.empty() && inputQueue_.back().kind == InputKind::Reset) inputQueue_.pop_back();
+        InputChunk control;
+        control.inputEpoch = epoch;
+        control.eventId = "reset-control";
+        if (sendControl) {
+            control.data = {3};
+            inputQueue_.push_back(std::move(control));
+            std::lock_guard<std::mutex> lock(commandMutex_);
+            ++queuedInputBytes_;
+        }
+        InputChunk marker;
+        marker.kind = InputKind::Reset;
+        marker.eventId = "reset-control";
+        inputQueue_.push_back(std::move(marker));
+        for (auto &input : inputQueue_) input.inputEpoch = epoch;
+        latestInputEpoch_.store(epoch);
+        return;
+    }
+    std::deque<InputChunk> completion;
+    bool closeBracket = pasteOpened_;
+    if (!inputQueue_.empty() && inputQueue_.front().offset > 0) {
+        InputChunk &current = inputQueue_.front();
+        size_t end = current.offset;
+        if (current.kind == InputKind::PasteStart || current.kind == InputKind::PasteEnd) {
+            end = current.data.size();
+            closeBracket = current.kind == InputKind::PasteStart;
+        } else {
+            while (end < current.data.size() && (current.data[end] & 0xc0) == 0x80) ++end;
+        }
+        if (end > current.offset) {
+            InputChunk suffix;
+            suffix.inputEpoch = epoch;
+            suffix.eventId = "reset-suffix";
+            suffix.data.assign(current.data.begin() + current.offset, current.data.begin() + end);
+            completion.push_back(std::move(suffix));
+        }
+    }
+    for (auto &input : inputQueue_) DiscardInput(input);
+    inputQueue_.clear();
+    auto append = [&](std::vector<uint8_t> bytes, InputKind kind) {
+        InputChunk input;
+        input.inputEpoch = epoch;
+        input.eventId = "reset-control";
+        input.kind = kind;
+        input.data = std::move(bytes);
+        completion.push_back(std::move(input));
+    };
+    if (closeBracket) append({27, '[', '2', '0', '1', '~'}, InputKind::Normal);
+    if (sendControl) append({3}, InputKind::Normal);
+    append({}, InputKind::Reset);
+    {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        latestInputEpoch_.store(epoch);
+        hasInputEpoch_.store(true);
+        seenEventIds_.clear();
+        eventIdOrder_.clear();
+        acceptedPasteId_.clear();
+        acceptedPasteBrackets_ = false;
+        for (const auto &input : completion) queuedInputBytes_ += input.data.size();
+    }
+    pasteOpened_ = false;
+    inputResetApplied_ = true;
+    inputQueue_.swap(completion);
 }
 
 void Session::ProcessInput() {
@@ -766,6 +1122,7 @@ void Session::ProcessInput() {
     };
     size_t writes = 0;
     while (!inputQueue_.empty() && writes < 16 && !resizeActive_ && IsOpenForInput()) {
+        if (inputResetPending_.load() && !inputResetApplied_) break;
         InputChunk &input = inputQueue_.front();
         if (!hasInputEpoch_.load(std::memory_order_acquire) ||
             input.inputEpoch != latestInputEpoch_.load(std::memory_order_acquire)) {
@@ -775,6 +1132,17 @@ void Session::ProcessInput() {
         }
         size_t remaining = input.data.size() - input.offset;
         if (remaining == 0) {
+            if (input.kind == InputKind::Reset) {
+                inputResetApplied_ = false;
+                inputResetPending_.store(false, std::memory_order_release);
+                emitInputEvent(NativeEventType::InputReset, input, 0);
+            } else {
+                if (input.kind == InputKind::PasteEnd) {
+                    std::lock_guard<std::mutex> lock(commandMutex_);
+                    acceptedPasteId_.clear();
+                }
+                emitInputEvent(NativeEventType::InputConsumed, input, 0);
+            }
             SecureClear(input.data);
             inputQueue_.pop_front();
             continue;
@@ -794,6 +1162,14 @@ void Session::ProcessInput() {
         size_t written = static_cast<size_t>(result);
         size_t availableCredit = 0;
         input.offset += written;
+        if (input.offset == input.data.size()) {
+            if (input.kind == InputKind::PasteStart) pasteOpened_ = !input.data.empty();
+            if (input.kind == InputKind::PasteEnd) {
+                pasteOpened_ = false;
+                std::lock_guard<std::mutex> lock(commandMutex_);
+                acceptedPasteId_.clear();
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(commandMutex_);
             if (written > queuedInputBytes_) {
@@ -968,11 +1344,50 @@ void Session::AdvanceOpen() {
     if (failed_ || remoteClosed_ || remoteEof_ || transportError_) {
         return;
     }
+    if (activeProbeId_ != 0) {
+        ProcessProbe();
+        return;
+    }
     ProcessResize();
     if (failed_) {
         return;
     }
+    if (pendingProbeId_ != 0 && !resizeActive_) {
+        ProcessProbe();
+        return;
+    }
     ProcessInput();
+}
+
+void Session::ProcessProbe() {
+    if (activeProbeId_ == 0) {
+        activeProbeId_ = pendingProbeId_;
+        pendingProbeId_ = 0;
+        probeDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    }
+    if (std::chrono::steady_clock::now() >= probeDeadline_) {
+        Fail("SSH connection check timed out");
+        return;
+    }
+    // A channel request with want-reply proves the remote endpoint responded.
+    // Both success and an explicit rejection are healthy responses. This does
+    // not execute a command or write to the shell's input stream.
+    int result = ssh_channel_request_env(channel_, "HTERMINAL_CONNECTION_CHECK", "");
+    if (result == SSH_AGAIN) return;
+    if (result != SSH_OK && ssh_get_error_code(session_) != SSH_REQUEST_DENIED) {
+        Fail("SSH connection check failed");
+        return;
+    }
+    auto event = std::make_unique<NativeEvent>();
+    event->type = NativeEventType::Probe;
+    event->sessionId = options_->sessionId;
+    event->connectionEpoch = options_->connectionEpoch;
+    event->requestId = activeProbeId_;
+    activeProbeId_ = 0;
+    acceptingInput_.store(pendingProbeId_ == 0 && !closeRequested_.load(), std::memory_order_release);
+    if (!sink_.Emit(std::move(event))) {
+        Fail("native event delivery failed");
+    }
 }
 
 } // namespace hterminal

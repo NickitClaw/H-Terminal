@@ -1,0 +1,24 @@
+name: Verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: terminal/package-lock.json
+      - run: ./scripts/verify.sh unit
+  device:
+    if: github.event_name == 'workflow_dispatch' && vars.HT_DEVICE_RUNNER == 'enabled'
+    runs-on: [self-hosted, macOS, hterminal-api26]
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/verify.sh all

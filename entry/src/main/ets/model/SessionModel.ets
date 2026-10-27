@@ -25,4 +25,7 @@ export class SessionSnapshot {
   message: string = '尚未连接';
   terminalReady: boolean = false;
   inputEnabled: boolean = false;
+  suspended: boolean = false;
+  checking: boolean = false;
+  pasting: boolean = false;
 }

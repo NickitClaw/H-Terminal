@@ -2,18 +2,20 @@
 
 H-Terminal 是一款专门适配 Huawei Pura X Max 折叠屏、HarmonyOS 7 的 SSH 终端 App。核心交互是在内屏约 90° 展开时，上方显示终端，下方提供适合命令行操作的桌面式键盘。
 
-**文档状态：B 阶段纵向原型已实现，完整 MVP 尚未完成。** 文中的角度、尺寸、队列和性能数值仍为待验证的初始值或验收目标，不代表已达到的能力。以下状态严格区分模拟器证据、代码实现和真机未验证项。
+**文档状态：主机、认证与多会话集成已实现，完整 MVP 仍有能力和真机验收缺口。** 文中的角度、尺寸、队列和性能数值仍为待验证的初始值或验收目标，不代表已达到的能力。以下状态严格区分模拟器证据、代码实现和真机未验证项。
 
 ## 当前实现与验证状态
 
 当前代码采用 API 26、ArkUI、ArkWeb/xterm.js 和 Native C++ SSH。依赖固定为 `@xterm/xterm 6.0.0`、`@xterm/addon-fit 0.11.0`、libssh 0.12.2 和 OpenSSL 3.5.9；两个 ABI 均从源码构建，未使用社区旧预编译库。
 
 已实现：
-- 单个直连 SSH 会话、密码认证、原生主机指纹确认、TOFU known_hosts、PTY shell、断开与手动重连。
+- 最多四个直连 SSH 会话标签、密码/Ed25519 公钥/keyboard-interactive 及两阶段组合认证、原生主机指纹确认、TOFU known_hosts、PTY shell、断开与手动重连。
 - xterm 终端、UTF-8 字节流、输出解析完成 ACK、输入分块与 `inputCredit` 背压、会话/连接/终端/输入代次隔离。
 - 完整六行与紧凑五行键盘、符号层、粘滞修饰键、基本系统 IME、复制粘贴与安全粘贴授权。
 - 普通/手动上下布局、自动折叠状态监听、实际终端区域 resize 和窗口/折痕坐标校验。
 - OpenSSL/libssh 双 ABI 构建、HAP 打包、模拟器调试签名与安装脚本。
+- 主机增删改、连接与布局偏好持久化、主机指纹查看及明确确认后的清除、受 HUKS 保护的私钥文件导入和删除。
+- 前后台和网络变化时暂停输入，恢复后等待服务器应答；可中断的分块粘贴、UTF-8/括号边界补全和优先 Ctrl+C。
 
 构建与安装：
 
@@ -32,7 +34,7 @@ H-Terminal 是一款专门适配 Huawei Pura X Max 折叠屏、HarmonyOS 7 的 S
 - `top` 全屏 TUI、`seq 1 10000` 大输出、完整/紧凑键盘切换、手动上下布局切换过程中连接保持。
 - 选择文本、`Ctrl+Shift+C/V`、PasteButton 授权后粘贴回终端；系统中文候选提交后 `你好` 恰好出现一次。
 
-尚未实现：主机配置管理、公钥/HUKS、keyboard-interactive/MFA、多会话、自动重连、跳板机、SFTP、片段、触控板、完整粘贴中断事务、OSC 52、Mosh。
+尚未实现：设备内生成不可导出的 SSH 私钥与 HUKS 外部签名、多点按住组合和长按重复、自动重连、跳板机、SFTP、片段、触控板、OSC 52、Mosh。
 
 尚未验证：Pura X Max 真机的折叠角度/折痕和 100 次开合、实体键盘与多点触控、长时性能/内存门槛、全部 IME、完整粘贴边界、x86_64 运行，以及第 11 节完整发布验收矩阵。当前结果不等于完整 MVP 或发布条件已满足。
 
@@ -61,6 +63,25 @@ npm --prefix terminal test
 ```
 
 Node 回归执行项目实际输入路由、布局、会话控制器、剪贴板方法、XtermBackend 与终端脚本，覆盖组合键编码、折痕回退、重新加载、失败重试、重连就绪和过期回调隔离。Native 回归在模拟器执行项目实际 Session/SessionRegistry 与构建出的 libssh/OpenSSL，包含尾包到达时序和慢 DNS 故障注入；测试依赖仅用于开发，不复制进应用 Web 资源。测试依赖 lockfile 已补全可选 nan 依赖，支持干净的 npm ci。仿真器无法代替真机、多点触控或长期性能验收。
+
+后续开发实现（2026-10-28）：
+
+- `scripts/verify.sh unit/build/device/all` 提供统一验证入口；GitHub Actions 的 push/PR 执行 Node 回归。完整设备任务需手动触发，并在已安装 DevEco、已启动且解锁 API26 arm64 模拟器、已完成 IME 初始化的专用 `hterminal-api26` runner 上运行；设置仓库变量 `HT_DEVICE_RUNNER=enabled` 后才启用。当前提交的验证证据来自本地 SDK/模拟器执行，不能等同于远端 CI 已运行。
+- Native 通过带应答的通道请求检查连接，明确拒绝也表示服务器仍能响应，10 秒无响应则失败。后台暂停输入和未发送事务；恢复或网络变化后禁用输入直至当前检查完成。前台每 30 秒检查是否空闲，空闲至少 30 秒的连接进入应答检查；进行中的粘贴不被定时检查打断。取消连接中的认证，不重放旧命令。
+- 每次粘贴固定 bracketed paste 模式，按最多 4KiB 的 UTF-8 完整字符块发送，并等待 Native 消费确认后提供下一块。停止/Ctrl+C 清空未发送内容；Native 先完成已部分写出的字符或括号边界，再补结束边界及控制输入，拒绝重复/过期取消。单次正文仍限制为 1MiB。
+- 主机配置和偏好使用平台 Preferences，配置只保存连接参数及凭据引用。未识别或损坏的存储不自动覆盖；写入串行并在失败时回滚。更换服务器密钥时必须断开该主机连接，查看并明确清除原指纹，下次仍须人工核实新指纹。
+- 私钥导入只支持 Ed25519，文件上限 64KiB，Native 异步解析并验证明文/口令加密 OpenSSH 文件；bcrypt KDF 限制为 1～1024 轮，解析前检查容器参数，拒绝异常开销。HUKS 为每个导入项生成独立 AES-256 保护密钥，以 GCM 加密文件副本并绑定凭据标识、公钥与指纹；密文和公钥元数据持久化，文件口令不保存。此路径保护的是导入副本，SSH 原私钥仍属于可导入文件，未实现 HUKS 内不可导出的 SSH 签名密钥。算法、流式输出与 AEAD 标签处理参照 [OpenHarmony HUKS 开发文档](https://github.com/openharmony/docs/blob/master/en/application-dev/security/UniversalKeystoreKit/huks-encryption-decryption-arkts.md)，硬件安全等级和锁屏策略仍须真机确认。
+- keyboard-interactive 支持 echo 标志、逐轮回答、取消、每轮超时，最多 16 个提示和 32 轮；支持密码或公钥部分认证成功后继续交互认证。认证表单使用原生组件，回答复制为普通数组传给 NAPI，并清理临时副本，避免 ArkUI 状态代理数组跨边界失败。
+- 标签各自持有控制器、xterm、滚动区、输入代次、修饰键和草稿。统一 Native 事件分发；切换不重建连接或终端。隐藏页缓存至多 256KiB 未确认输出并停止 ACK，切回后继续解析；活动及回收中的 Native 线程仍合计最多四个。
+
+```bash
+./scripts/verify.sh unit    # 普通 Node 环境即可运行
+./scripts/verify.sh build   # Node 回归 + 完整双 ABI/HAP 构建
+./scripts/verify.sh device  # 已有构建 + Native/认证/HUKS/UI 设备回归
+./scripts/verify.sh all     # 完整构建与设备验证
+```
+
+设备验证仅连接隔离的本地 SSH 夹具，生成临时测试密钥；已验证多会话并发、加密私钥和两轮 MFA、应答/拒绝/超时探测、逐字节短写下的中文/emoji 与括号边界取消。`verify-device-storage.py` 临时注入设备探针执行真实 HUKS 和 NAPI，验证重读、完整性拒绝和删除后恢复原始源文件，清理重建 HAP 并检查探针未进入正常产物。测试日志、签名和临时私钥不提交仓库。真实服务器的特定 MFA/堡垒机流程、真机开合、多点/实体键盘、完整 IME 和长时性能仍按第 11 节单独验收。
 
 ## 1. 产品目标与首版范围
 

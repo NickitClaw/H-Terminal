@@ -185,7 +185,8 @@ void DispatchEvent(napi_env env, napi_value callback, void *context, void *data)
                     SetString(env, object, "state", event->state);
                 break;
             case NativeEventType::HostKey:
-                ok = SetString(env, object, "type", "hostKey") &&
+            case NativeEventType::HostIdentity:
+                ok = SetString(env, object, "type", event->type == NativeEventType::HostKey ? "hostKey" : "hostIdentity") &&
                     SetString(env, object, "host", event->host) &&
                     SetNumber(env, object, "port", event->port) &&
                     SetString(env, object, "keyType", event->keyType) &&
@@ -213,6 +214,31 @@ void DispatchEvent(napi_env env, napi_value callback, void *context, void *data)
                     SetNumber(env, object, "inputEpoch", event->inputEpoch) &&
                     SetString(env, object, "eventId", event->eventId);
                 break;
+            case NativeEventType::Probe:
+                ok = SetString(env, object, "type", "probe") &&
+                    SetNumber(env, object, "requestId", event->requestId);
+                break;
+            case NativeEventType::InputReset:
+                ok = SetString(env, object, "type", "inputReset") &&
+                    SetNumber(env, object, "inputEpoch", event->inputEpoch);
+                break;
+            case NativeEventType::AuthChallenge: {
+                napi_value prompts = nullptr;
+                ok = SetString(env, object, "type", "authChallenge") &&
+                    SetNumber(env, object, "requestId", event->requestId) &&
+                    SetString(env, object, "title", event->title) && SetString(env, object, "instruction", event->instruction) &&
+                    napi_create_array_with_length(env, event->prompts.size(), &prompts) == napi_ok;
+                for (size_t i = 0; ok && i < event->prompts.size(); ++i) {
+                    napi_value prompt = nullptr, echo = nullptr;
+                    ok = napi_create_object(env, &prompt) == napi_ok &&
+                        SetString(env, prompt, "text", event->prompts[i].text) &&
+                        napi_get_boolean(env, event->prompts[i].echo, &echo) == napi_ok &&
+                        napi_set_named_property(env, prompt, "echo", echo) == napi_ok &&
+                        napi_set_element(env, prompts, static_cast<uint32_t>(i), prompt) == napi_ok;
+                }
+                ok = ok && napi_set_named_property(env, object, "prompts", prompts) == napi_ok;
+                break;
+            }
         }
         ok = ok && SetString(env, object, "sessionId", event->sessionId) &&
             SetNumber(env, object, "connectionEpoch", event->connectionEpoch) &&
@@ -279,6 +305,13 @@ bool NumberProperty(napi_env env, napi_value object, const char *name, uint64_t 
     return ReadProperty(env, object, name, property) && ReadNumber(env, property, value);
 }
 
+bool OptionalStringProperty(napi_env env, napi_value object, const char *name, std::string &value, size_t maximum) {
+    napi_value property = nullptr;
+    napi_valuetype type = napi_undefined;
+    return ReadProperty(env, object, name, property) && napi_typeof(env, property, &type) == napi_ok &&
+        (type == napi_undefined || ReadString(env, property, value, maximum));
+}
+
 bool ContainsNul(const std::string &value) {
     return value.find('\0') != std::string::npos;
 }
@@ -296,13 +329,18 @@ std::unique_ptr<NativeConnectOptions> ParseConnectOptions(napi_env env, napi_val
         NumberProperty(env, value, "port", port) &&
         StringProperty(env, value, "username", options->username, 1024) &&
         StringProperty(env, value, "password", options->password, kMaxInputBytes) &&
+        OptionalStringProperty(env, value, "authMethod", options->authMethod, 48) &&
+        OptionalStringProperty(env, value, "privateKey", options->privateKey, kMaxInputBytes) &&
         NumberProperty(env, value, "cols", cols) && NumberProperty(env, value, "rows", rows);
     if (!ok || options->sessionId.empty() || options->filesDir.empty() || options->filesDir[0] != '/' ||
         options->host.empty() || options->username.empty() || port == 0 || port > 65535 || cols == 0 ||
         rows == 0 || cols > 65535 || rows > 65535 || ContainsNul(options->filesDir) || ContainsNul(options->host) ||
-        ContainsNul(options->username) || ContainsNul(options->password)) {
+        ContainsNul(options->username) || ContainsNul(options->password) || ContainsNul(options->privateKey)) {
         return nullptr;
     }
+    if (options->authMethod != "password" && options->authMethod != "publickey" &&
+        options->authMethod != "keyboard-interactive" && options->authMethod != "password+keyboard-interactive" &&
+        options->authMethod != "publickey+keyboard-interactive") return nullptr;
     options->port = static_cast<uint32_t>(port);
     options->cols = static_cast<int>(cols);
     options->rows = static_cast<int>(rows);
@@ -355,6 +393,162 @@ napi_value TrustDecision(napi_env env, napi_callback_info info) {
         session->TrustDecision(accepted);
     }
     return Undefined(env);
+}
+
+napi_value ProbeSession(napi_env env, napi_callback_info info) {
+    std::vector<napi_value> args;
+    std::string id;
+    uint64_t epoch = 0, request = 0;
+    if (!Arguments(env, info, 3, args) || !ReadString(env, args[0], id, 128) || id.empty() ||
+        !ReadNumber(env, args[1], epoch) || !ReadNumber(env, args[2], request) || request == 0) {
+        napi_throw_error(env, "H-Terminal", "invalid connection check");
+        return Undefined(env);
+    }
+    auto session = Manager::Instance().Find(id, epoch);
+    if (session) session->Probe(request);
+    return Undefined(env);
+}
+
+napi_value ResetInput(napi_env env, napi_callback_info info) {
+    std::vector<napi_value> args;
+    std::string id;
+    uint64_t epoch = 0, inputEpoch = 0;
+    bool sendControl = false;
+    if (!Arguments(env, info, 4, args) || !ReadString(env, args[0], id, 128) || id.empty() ||
+        !ReadNumber(env, args[1], epoch) || !ReadNumber(env, args[2], inputEpoch) ||
+        napi_get_value_bool(env, args[3], &sendControl) != napi_ok) {
+        napi_throw_error(env, "H-Terminal", "invalid input cancellation");
+        return Undefined(env);
+    }
+    auto session = Manager::Instance().Find(id, epoch);
+    if (session) session->ResetInput(inputEpoch, sendControl);
+    return Undefined(env);
+}
+
+napi_value AnswerAuthentication(napi_env env, napi_callback_info info) {
+    std::vector<napi_value> args;
+    std::string id;
+    uint64_t epoch = 0, request = 0;
+    uint32_t count = 0;
+    bool array = false;
+    if (!Arguments(env, info, 4, args) || !ReadString(env, args[0], id, 128) || id.empty() ||
+        !ReadNumber(env, args[1], epoch) || !ReadNumber(env, args[2], request) || request == 0 ||
+        napi_is_array(env, args[3], &array) != napi_ok || !array ||
+        napi_get_array_length(env, args[3], &count) != napi_ok || count > 16) {
+        napi_throw_error(env, "H-Terminal", "invalid authentication response"); return Undefined(env);
+    }
+    std::vector<std::string> answers(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        napi_value value = nullptr;
+        if (napi_get_element(env, args[3], i, &value) != napi_ok || !ReadString(env, value, answers[i], 4096) ||
+            ContainsNul(answers[i])) {
+            for (auto &answer : answers) SecureClear(answer);
+            napi_throw_error(env, "H-Terminal", "invalid authentication answer"); return Undefined(env);
+        }
+    }
+    auto session = Manager::Instance().Find(id, epoch);
+    if (session) session->AnswerAuthentication(request, std::move(answers));
+    else for (auto &answer : answers) SecureClear(answer);
+    return Undefined(env);
+}
+
+struct KeyInspection {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string key, passphrase, publicKey, fingerprint;
+    bool success = false;
+    int operation = 0;
+    std::string filesDir, host, expectedFingerprint;
+    uint32_t port = 0;
+    ~KeyInspection() { SecureClear(key); SecureClear(passphrase); }
+};
+
+napi_value QueueKeyInspection(napi_env env, std::unique_ptr<KeyInspection> task) {
+    napi_value promise = nullptr, name = nullptr;
+    if (napi_create_promise(env, &task->deferred, &promise) != napi_ok ||
+        napi_create_string_utf8(env, "Inspect SSH identity", NAPI_AUTO_LENGTH, &name) != napi_ok) {
+        napi_throw_error(env, "H-Terminal", "could not prepare key operation"); return Undefined(env);
+    }
+    auto execute = [](napi_env, void *data) {
+        auto *task = static_cast<KeyInspection *>(data);
+        ssh_key key = nullptr;
+        char *pub = nullptr, *fingerprint = nullptr;
+        unsigned char *hash = nullptr;
+        size_t length = 0;
+        try {
+        if (task->operation > 0) {
+            TrustedHostKey known;
+            task->success = AccessTrustedHostKey(task->filesDir, task->host, task->port, task->expectedFingerprint,
+                task->operation == 2, known);
+            task->publicKey = known.publicKey;
+            task->fingerprint = known.fingerprint;
+        } else if (SupportedPrivateKeyContainer(task->key) && EnsureSshInitialized() &&
+            ssh_pki_import_privkey_base64(task->key.c_str(), task->passphrase.c_str(),
+            nullptr, nullptr, &key) == SSH_OK && key && ssh_key_type(key) == SSH_KEYTYPE_ED25519 &&
+            ssh_pki_export_pubkey_base64(key, &pub) == SSH_OK &&
+            ssh_get_publickey_hash(key, SSH_PUBLICKEY_HASH_SHA256, &hash, &length) == SSH_OK) {
+            fingerprint = ssh_get_fingerprint_hash(SSH_PUBLICKEY_HASH_SHA256, hash, length);
+            if (pub && fingerprint) {
+                task->publicKey = std::string("ssh-ed25519 ") + pub;
+                task->fingerprint = fingerprint;
+                task->success = true;
+            }
+        }
+        } catch (...) { task->success = false; }
+        if (key) ssh_key_free(key);
+        if (pub) ssh_string_free_char(pub);
+        if (fingerprint) ssh_string_free_char(fingerprint);
+        if (hash) ssh_clean_pubkey_hash(&hash);
+        SecureClear(task->key); SecureClear(task->passphrase);
+    };
+    auto complete = [](napi_env env, napi_status status, void *data) {
+        std::unique_ptr<KeyInspection> task(static_cast<KeyInspection *>(data));
+        if (env == nullptr) return;
+        napi_value value = nullptr;
+        if (status == napi_ok && task->success && napi_create_object(env, &value) == napi_ok &&
+            SetString(env, value, "publicKey", task->publicKey) && SetString(env, value, "fingerprint", task->fingerprint)) {
+            napi_resolve_deferred(env, task->deferred, value);
+        } else {
+            napi_value message = nullptr;
+            napi_create_string_utf8(env, "Key operation failed: invalid key, passphrase or trusted fingerprint", NAPI_AUTO_LENGTH, &message);
+            napi_create_error(env, nullptr, message, &value);
+            napi_reject_deferred(env, task->deferred, value);
+        }
+        napi_delete_async_work(env, task->work);
+    };
+    if (napi_create_async_work(env, nullptr, name, execute, complete, task.get(), &task->work) != napi_ok ||
+        napi_queue_async_work(env, task->work) != napi_ok) {
+        if (task->work) napi_delete_async_work(env, task->work);
+        napi_throw_error(env, "H-Terminal", "could not inspect private key"); return Undefined(env);
+    }
+    task.release();
+    return promise;
+}
+
+napi_value InspectPrivateKey(napi_env env, napi_callback_info info) {
+    std::vector<napi_value> args;
+    auto task = std::make_unique<KeyInspection>();
+    if (!Arguments(env, info, 2, args) || !ReadString(env, args[0], task->key, kMaxInputBytes) ||
+        !ReadString(env, args[1], task->passphrase, 4096) || ContainsNul(task->key) || ContainsNul(task->passphrase)) {
+        napi_throw_error(env, "H-Terminal", "invalid private key input"); return Undefined(env);
+    }
+    return QueueKeyInspection(env, std::move(task));
+}
+
+template<bool Remove> napi_value TrustedHostKeyOperation(napi_env env, napi_callback_info info) {
+    std::vector<napi_value> args;
+    auto task = std::make_unique<KeyInspection>();
+    uint64_t port = 0;
+    if (!Arguments(env, info, Remove ? 4 : 3, args) || !ReadString(env, args[0], task->filesDir, 4096) ||
+        task->filesDir.empty() || task->filesDir[0] != '/' || !ReadString(env, args[1], task->host, 1024) ||
+        task->host.empty() || !ReadNumber(env, args[2], port) || port == 0 || port > 65535 ||
+        (Remove && (!ReadString(env, args[3], task->expectedFingerprint, 128) || task->expectedFingerprint.empty())) ||
+        ContainsNul(task->filesDir) || ContainsNul(task->host)) {
+        napi_throw_error(env, "H-Terminal", "invalid trusted-host operation"); return Undefined(env);
+    }
+    task->port = static_cast<uint32_t>(port);
+    task->operation = Remove ? 2 : 1;
+    return QueueKeyInspection(env, std::move(task));
 }
 
 enum class Base64InputResult {
@@ -471,10 +665,22 @@ napi_value WriteInput(napi_env env, napi_callback_info info) {
         napi_throw_error(env, "H-Terminal", "decoded terminal input exceeds 64 KiB");
         return Undefined(env);
     }
+    std::string phase, pasteId;
+    InputKind kind = InputKind::Normal;
+    if (StringProperty(env, args[0], "pastePhase", phase, 16) && !phase.empty()) {
+        if (!StringProperty(env, args[0], "pasteId", pasteId, 128) || pasteId.empty()) {
+            napi_throw_error(env, "H-Terminal", "invalid paste transaction");
+            return Undefined(env);
+        }
+        if (phase == "start") kind = InputKind::PasteStart;
+        else if (phase == "data") kind = InputKind::PasteData;
+        else if (phase == "end") kind = InputKind::PasteEnd;
+        else { napi_throw_error(env, "H-Terminal", "invalid paste phase"); return Undefined(env); }
+    }
     bool accepted = false;
     auto session = Manager::Instance().Find(sessionId, epoch);
-    if (session != nullptr && !bytes.empty()) {
-        accepted = session->WriteInput(inputEpoch, eventId, std::move(bytes));
+    if (session != nullptr) {
+        accepted = session->WriteInput(inputEpoch, eventId, std::move(bytes), kind, pasteId);
     }
     napi_value result = nullptr;
     napi_get_boolean(env, accepted, &result);
@@ -560,6 +766,12 @@ napi_value Register(napi_env env, napi_value exports) {
         {"initialize", nullptr, Safely<Initialize>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connect", nullptr, Safely<Connect>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"trustDecision", nullptr, Safely<TrustDecision>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"probeSession", nullptr, Safely<ProbeSession>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resetInput", nullptr, Safely<ResetInput>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"answerAuthentication", nullptr, Safely<AnswerAuthentication>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"inspectPrivateKey", nullptr, Safely<InspectPrivateKey>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"inspectKnownHost", nullptr, Safely<TrustedHostKeyOperation<false>>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"forgetKnownHost", nullptr, Safely<TrustedHostKeyOperation<true>>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"writeInput", nullptr, Safely<WriteInput>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resize", nullptr, Safely<Resize>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"acknowledgeOutput", nullptr, Safely<AcknowledgeOutput>, nullptr, nullptr, nullptr, napi_default, nullptr},

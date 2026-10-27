@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace hterminal {
 
@@ -25,6 +26,8 @@ struct NativeConnectOptions {
     uint32_t port = 0;
     std::string username;
     std::string password;
+    std::string authMethod = "password";
+    std::string privateKey;
     int cols = 0;
     int rows = 0;
 
@@ -33,8 +36,11 @@ struct NativeConnectOptions {
     NativeConnectOptions &operator=(const NativeConnectOptions &) = delete;
     ~NativeConnectOptions() {
         SecureClear(password);
+        SecureClear(privateKey);
     }
 };
+
+enum class InputKind { Normal, PasteStart, PasteData, PasteEnd, Reset };
 
 enum class NativeEventType {
     State,
@@ -43,7 +49,13 @@ enum class NativeEventType {
     Error,
     InputCredit,
     InputConsumed,
+    Probe,
+    InputReset,
+    AuthChallenge,
+    HostIdentity,
 };
+
+struct AuthPrompt { std::string text; bool echo = false; };
 
 struct NativeEvent {
     NativeEventType type = NativeEventType::Error;
@@ -61,6 +73,10 @@ struct NativeEvent {
     std::string fingerprint;
     uint64_t inputEpoch = 0;
     std::string eventId;
+    uint64_t requestId = 0;
+    std::string title;
+    std::string instruction;
+    std::vector<AuthPrompt> prompts;
 };
 
 class NativeEventSink {

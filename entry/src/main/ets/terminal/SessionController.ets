@@ -4,6 +4,8 @@ import { HostKeyInfo, ConnectionState, SessionSnapshot, TerminalSize } from '../
 import { InputRouter } from '../input/InputRouter';
 import { KeyDefinition } from '../input/KeyboardModel';
 import { ByteCodec } from '../util/ByteCodec';
+import { PasteTransaction } from '../input/PasteTransaction';
+import { NativeRuntime } from './NativeRuntime';
 import { TerminalMessage } from './TerminalBackend';
 import { XtermBackend } from './XtermBackend';
 
@@ -20,6 +22,8 @@ class PendingInput {
 export class SessionController {
   onSnapshot: (snapshot: SessionSnapshot) => void = (_snapshot: SessionSnapshot): void => {};
   onHostKey: (info: HostKeyInfo) => void = (_info: HostKeyInfo): void => {};
+  onHostIdentity: (info: HostKeyInfo) => void = (_info: HostKeyInfo): void => {};
+  onAuthChallenge: (event: NativeEvent) => void = (_event: NativeEvent): void => {};
   onCopy: (text: string) => void = (_text: string): void => {};
   onPasteRequest: () => void = (): void => {};
   onAction: (action: string) => void = (_action: string): void => {};
@@ -40,9 +44,21 @@ export class SessionController {
   private rendererFailed: boolean = false;
   private terminalInitialized: boolean = false;
   private rendererRecovering: boolean = false;
+  private foreground: boolean = true;
+  private networkAvailable: boolean = true;
+  private checking: boolean = false;
+  private probeCounter: number = 0;
+  private probeTimer: number = -1;
+  private pasteTransaction: PasteTransaction | null = null;
+  private inputResetPending: boolean = false;
+  private selected: boolean = true;
+  private connectedHost: string = '';
+  private connectedPort: number = 0;
+  private lastActivity: number = Date.now();
 
-  constructor(backend: XtermBackend) {
+  constructor(backend: XtermBackend, sessionId: string = 'session-1') {
     this.backend = backend;
+    this.sessionId = sessionId;
   }
 
   getSessionId(): string {
@@ -53,19 +69,35 @@ export class SessionController {
     return this.connectionEpoch;
   }
 
+  getSnapshot(): SessionSnapshot { return this.snapshot; }
+  isConnectedTo(host: string, port: number): boolean {
+    return this.attemptActive && this.connectedHost.toLowerCase() === host.trim().toLowerCase() && this.connectedPort === port;
+  }
+
+  checkIdleConnection(now: number = Date.now()): void {
+    if (this.foreground && this.networkAvailable && !this.checking && this.pasteTransaction === null &&
+      this.snapshot.state === ConnectionState.OPEN && now - this.lastActivity >= 30000) this.checkConnection();
+  }
+
   initialize(filesDir: string): void {
     if (this.initialized) {
       return;
     }
     this.filesDir = filesDir;
     this.initialized = true;
-    native.initialize((event: NativeEvent): void => {
+    NativeRuntime.attach(this.sessionId, (event: NativeEvent): void => {
       this.handleNativeEvent(event);
     });
     this.backend.configure(this.sessionId, this.connectionEpoch, this.terminalGeneration, this.input.getInputEpoch());
   }
 
-  connect(host: string, port: number, username: string, password: string): boolean {
+  connect(host: string, port: number, username: string, password: string,
+    authMethod: string = 'password', privateKey: string = ''): boolean {
+    if (!this.initialized) return false;
+    if (!this.foreground || !this.networkAvailable || !this.selected) {
+      this.onToast('请返回前台并确认网络可用');
+      return false;
+    }
     if (!this.snapshot.terminalReady || this.terminalSize.cols <= 0 || this.terminalSize.rows <= 0) {
       this.onToast('终端尺寸尚未就绪');
       return false;
@@ -77,7 +109,7 @@ export class SessionController {
     }
     const normalizedHost = host.trim();
     const normalizedUser = username.trim();
-    if (normalizedHost.length === 0 || normalizedUser.length === 0 || !Number.isFinite(port) || port < 1 || port > 65535) {
+    if (normalizedHost.length === 0 || normalizedUser.length === 0 || !Number.isInteger(port) || port < 1 || port > 65535) {
       this.onToast('请检查主机、端口和用户名');
       return false;
     }
@@ -104,9 +136,13 @@ export class SessionController {
       username: normalizedUser,
       password: password,
       cols: initialCols,
-      rows: initialRows
+      rows: initialRows,
+      authMethod: authMethod,
+      privateKey: privateKey
     };
     this.attemptActive = true;
+    this.connectedHost = normalizedHost;
+    this.connectedPort = port;
     this.publish(ConnectionState.CONNECTING, '正在连接');
     try {
       native.connect(options);
@@ -116,10 +152,12 @@ export class SessionController {
       return false;
     } finally {
       options.password = '';
+      options.privateKey = '';
     }
   }
 
   disconnect(): void {
+    this.clearProbe();
     this.attemptActive = false;
     if (this.connectionEpoch > 0) {
       native.closeSession(this.sessionId, this.connectionEpoch);
@@ -140,12 +178,29 @@ export class SessionController {
     }
   }
 
+  answerAuthentication(requestId: number, answers: string[]): void {
+    if (!this.attemptActive || !this.foreground || this.snapshot.state !== ConnectionState.AUTHENTICATING) return;
+    // ArkUI state arrays can be proxy objects. Pass a plain array across NAPI.
+    const copy: string[] = [];
+    for (let i = 0; i < answers.length; i++) copy.push(answers[i]);
+    try { native.answerAuthentication(this.sessionId, this.connectionEpoch, requestId, copy); }
+    finally { copy.fill(''); }
+  }
+
   routeKey(definition: KeyDefinition): void {
     if (!this.snapshot.inputEnabled) {
       return;
     }
     const routed = this.input.route(definition);
     if (routed === null) {
+      return;
+    }
+    if (this.pasteTransaction !== null && routed.kind !== 'action') {
+      if (routed.kind === 'key' && routed.ctrl && !routed.alt && routed.key.toLowerCase() === 'c') {
+        this.stopPaste(true);
+      } else {
+        this.onToast('请先停止或等待粘贴完成');
+      }
       return;
     }
     if (routed.kind === 'action') {
@@ -178,8 +233,93 @@ export class SessionController {
   }
 
   setImeMode(enabled: boolean): void {
-    this.invalidateInput();
+    if (this.pasteTransaction !== null) this.stopPaste(false);
+    else this.invalidateInput();
     this.backend.focus(enabled);
+  }
+
+  setForeground(foreground: boolean): void {
+    if (this.foreground === foreground) return;
+    this.foreground = foreground;
+    this.backend.setOutputPaused(!foreground || !this.selected);
+    this.pauseInputs();
+    if (foreground && this.networkAvailable) this.checkConnection();
+  }
+
+  setNetworkAvailable(available: boolean): void {
+    if (this.networkAvailable === available) return;
+    this.networkAvailable = available;
+    this.pauseInputs();
+    if (available && this.foreground) this.checkConnection();
+  }
+
+  setSelected(selected: boolean): void {
+    if (this.selected === selected) return;
+    this.selected = selected;
+    this.backend.setOutputPaused(!selected || !this.foreground);
+    if (!selected) {
+      if (this.attemptActive && this.snapshot.state !== ConnectionState.OPEN) {
+        this.disconnect();
+        return;
+      }
+      this.stopPaste(false);
+      this.backend.focus(false);
+    } else {
+      this.backend.fit();
+    }
+    this.publish(this.snapshot.state, this.snapshot.message);
+  }
+
+  private pauseInputs(): void {
+    this.clearProbe();
+    this.stopPaste(false);
+    this.backend.focus(false);
+    if (this.attemptActive && this.snapshot.state !== ConnectionState.OPEN) {
+      this.disconnect();
+    } else {
+      this.publish(this.snapshot.state, this.foreground ? '等待网络连接检查' : '已暂停输入');
+    }
+  }
+
+  private checkConnection(): void {
+    if (!this.attemptActive || this.snapshot.state !== ConnectionState.OPEN) return;
+    this.checking = true;
+    const request = ++this.probeCounter;
+    this.publish(ConnectionState.OPEN, '正在检查连接');
+    this.probeTimer = setTimeout((): void => {
+      if (this.checking && request === this.probeCounter) {
+        native.closeSession(this.sessionId, this.connectionEpoch);
+        this.markFailed('连接检查超时，请手动重连');
+      }
+    }, 10000);
+    try {
+      native.probeSession(this.sessionId, this.connectionEpoch, request);
+    } catch (_error) {
+      native.closeSession(this.sessionId, this.connectionEpoch);
+      this.markFailed('无法检查连接，请手动重连');
+    }
+  }
+
+  private clearProbe(): void {
+    if (this.probeTimer >= 0) clearTimeout(this.probeTimer);
+    this.probeTimer = -1;
+    this.checking = false;
+    this.probeCounter++;
+  }
+
+  stopPaste(sendControl: boolean = false): void {
+    this.clearPendingInputs();
+    this.invalidateInput();
+    if (this.attemptActive && this.snapshot.state === ConnectionState.OPEN) {
+      this.inputResetPending = true;
+      this.publish(ConnectionState.OPEN, '正在停止未发送输入');
+      try {
+        native.resetInput(this.sessionId, this.connectionEpoch, this.input.getInputEpoch(), sendControl);
+      } catch (_error) {
+        native.closeSession(this.sessionId, this.connectionEpoch);
+        this.markFailed('无法停止输入，请手动重连');
+      }
+    }
   }
 
   handleRendererFailure(message: string): void {
@@ -260,6 +400,17 @@ export class SessionController {
     }
     if (message.type === 'input') {
       this.enqueueInput(message);
+    } else if (message.type === 'paste') {
+      if (!this.snapshot.inputEnabled || message.inputEpoch !== this.input.getInputEpoch() ||
+        this.pasteTransaction !== null || (message.eventId ?? '').length === 0) return;
+      try {
+        const bytes = ByteCodec.decodeBytes(message.data ?? '');
+        if (bytes.length > 1024 * 1024) return;
+        this.pasteTransaction = new PasteTransaction(this.sessionId, this.connectionEpoch,
+          this.input.getInputEpoch(), message.eventId ?? '', bytes, message.bracketed === true);
+        this.publish(this.snapshot.state, '正在粘贴，可随时停止');
+        this.advancePaste();
+      } catch (_error) { this.onToast('粘贴编码无效'); }
     } else if (message.type === 'ack') {
       const ack: NativeAck = {
         sessionId: this.sessionId,
@@ -283,11 +434,13 @@ export class SessionController {
   }
 
   dispose(): void {
+    this.clearProbe();
     this.attemptActive = false;
     this.clearPendingInputs();
     this.input.invalidate();
     if (this.initialized) {
-      native.dispose();
+      if (this.connectionEpoch > 0) native.closeSession(this.sessionId, this.connectionEpoch);
+      NativeRuntime.detach(this.sessionId);
       this.initialized = false;
     }
   }
@@ -296,14 +449,34 @@ export class SessionController {
     if (!this.attemptActive || event.sessionId !== this.sessionId || event.connectionEpoch !== this.connectionEpoch) {
       return;
     }
+    if (event.type === 'probe') {
+      if (this.checking && this.foreground && this.networkAvailable && event.requestId === this.probeCounter) {
+        this.clearProbe();
+        this.lastActivity = Date.now();
+        this.publish(ConnectionState.OPEN, '连接已确认');
+        this.flushInputs();
+      }
+      return;
+    }
     if (event.type === 'inputCredit') {
       this.flushInputs();
       return;
     }
     if (event.type === 'inputConsumed') {
+      this.lastActivity = Date.now();
+      if (event.inputEpoch === this.input.getInputEpoch() && this.pasteTransaction !== null &&
+        this.pasteTransaction.consume(event.eventId ?? '', event.byteLength ?? -1)) this.advancePaste();
+      return;
+    }
+    if (event.type === 'inputReset') {
+      if (event.inputEpoch === this.input.getInputEpoch()) {
+        this.inputResetPending = false;
+        this.publish(this.snapshot.state, this.checking ? '正在检查连接' : '未发送输入已停止');
+      }
       return;
     }
     if (event.type === 'output') {
+      this.lastActivity = Date.now();
       if (event.terminalGeneration !== this.terminalGeneration || (event.byteLength ?? 0) > 32768) {
         return;
       }
@@ -321,14 +494,23 @@ export class SessionController {
       }
       return;
     }
-    if (event.type === 'hostKey') {
+    if (event.type === 'authChallenge') {
+      if (!this.foreground) { this.disconnect(); return; }
+      this.publish(ConnectionState.AUTHENTICATING, '等待认证回答');
+      this.onAuthChallenge(event);
+      return;
+    }
+    if (event.type === 'hostKey' || event.type === 'hostIdentity') {
       const info = new HostKeyInfo();
       info.host = event.host ?? '';
       info.port = event.port ?? 0;
       info.keyType = event.keyType ?? '';
       info.fingerprint = event.fingerprint ?? '';
-      this.publish(ConnectionState.VERIFYING_HOST, '请核实主机密钥');
-      this.onHostKey(info);
+      this.onHostIdentity(info);
+      if (event.type === 'hostKey') {
+        this.publish(ConnectionState.VERIFYING_HOST, '请核实主机密钥');
+        this.onHostKey(info);
+      }
       return;
     }
     if (event.type === 'error') {
@@ -340,14 +522,15 @@ export class SessionController {
       if (state === null || state === ConnectionState.IDLE) {
         return;
       }
+      if (state === ConnectionState.CLOSED || state === ConnectionState.FAILED) {
+        this.attemptActive = false;
+        this.clearProbe();
+        this.clearPendingInputs();
+        this.invalidateInput();
+      }
       this.publish(state, event.message ?? state);
       if (state === ConnectionState.OPEN && this.terminalSize.cols > 0 && this.terminalSize.rows > 0) {
         native.resize(this.sessionId, this.connectionEpoch, this.terminalSize.cols, this.terminalSize.rows);
-      }
-      if (state === ConnectionState.CLOSED || state === ConnectionState.FAILED) {
-        this.attemptActive = false;
-        this.clearPendingInputs();
-        this.invalidateInput();
       }
     }
   }
@@ -366,7 +549,11 @@ export class SessionController {
     ready.state = this.snapshot.state;
     ready.message = this.rendererRecovering ? '终端已重新加载，请连接' : this.snapshot.message;
     ready.terminalReady = true;
-    ready.inputEnabled = ready.state === ConnectionState.OPEN;
+    ready.suspended = !this.foreground || !this.networkAvailable;
+    ready.checking = this.checking;
+    ready.pasting = this.pasteTransaction !== null;
+    ready.inputEnabled = ready.state === ConnectionState.OPEN && !ready.suspended && !ready.checking &&
+      !this.inputResetPending && this.selected;
     this.rendererRecovering = false;
     this.snapshot = ready;
     this.onSnapshot(ready);
@@ -377,6 +564,7 @@ export class SessionController {
       (message.eventId ?? '').length === 0) {
       return;
     }
+    this.lastActivity = Date.now();
     try {
       const encoded = message.data ?? '';
       if (encoded.length > 1400000) {
@@ -384,6 +572,11 @@ export class SessionController {
         return;
       }
       const bytes = ByteCodec.decodeBytes(encoded);
+      if (this.pasteTransaction !== null) {
+        if (bytes.length === 1 && bytes[0] === 3) this.stopPaste(true);
+        else this.onToast('请先停止或等待粘贴完成');
+        return;
+      }
       if (bytes.length > 1024 * 1024 + 12 || this.pendingInputBytes + bytes.length > 1024 * 1024 + 65536) {
         this.onToast('输入队列已满，内容未发送');
         return;
@@ -428,8 +621,28 @@ export class SessionController {
   }
 
   private clearPendingInputs(): void {
+    this.inputResetPending = false;
+    this.pasteTransaction?.clear();
+    this.pasteTransaction = null;
     this.pendingInputs = [];
     this.pendingInputBytes = 0;
+  }
+
+  private advancePaste(): void {
+    if (this.pasteTransaction === null) return;
+    if (this.pasteTransaction.done()) {
+      this.pasteTransaction.clear();
+      this.pasteTransaction = null;
+      this.publish(this.snapshot.state, '粘贴完成');
+      return;
+    }
+    const next = this.pasteTransaction.next();
+    if (next !== null) {
+      const length = ByteCodec.decodeBytes(next.data).length;
+      this.pendingInputs.push(new PendingInput(next, length));
+      this.pendingInputBytes += length;
+      this.flushInputs();
+    }
   }
 
   private invalidateInput(): void {
@@ -438,6 +651,7 @@ export class SessionController {
   }
 
   private failRenderer(message: string): void {
+    this.clearProbe();
     this.attemptActive = false;
     if (this.connectionEpoch > 0) {
       native.closeSession(this.sessionId, this.connectionEpoch);
@@ -453,6 +667,7 @@ export class SessionController {
   }
 
   private markFailed(message: string): void {
+    this.clearProbe();
     this.attemptActive = false;
     this.clearPendingInputs();
     this.invalidateInput();
@@ -464,7 +679,11 @@ export class SessionController {
     next.state = state;
     next.message = message;
     next.terminalReady = this.snapshot.terminalReady;
-    next.inputEnabled = state === ConnectionState.OPEN && next.terminalReady;
+    next.suspended = !this.foreground || !this.networkAvailable;
+    next.checking = this.checking;
+    next.pasting = this.pasteTransaction !== null;
+    next.inputEnabled = state === ConnectionState.OPEN && next.terminalReady && !next.suspended && !next.checking &&
+      !this.inputResetPending && this.selected;
     this.snapshot = next;
     this.onSnapshot(next);
   }

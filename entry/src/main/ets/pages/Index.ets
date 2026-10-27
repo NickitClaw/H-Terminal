@@ -11,6 +11,15 @@ import { LaptopKeyboard } from '../components/LaptopKeyboard';
 import { LayoutPreference, PostureEngine, PostureSnapshot } from '../posture/PostureEngine';
 import { LayoutCoordinator, LayoutResult } from '../posture/LayoutCoordinator';
 import { ByteCodec } from '../util/ByteCodec';
+import { AppLifecycle } from '../lifecycle/AppLifecycle';
+import { NetworkMonitor } from '../lifecycle/NetworkMonitor';
+import { HostProfile, HostRepository, UserPreferences, AuthMethod } from '../storage/HostRepository';
+import { PreferencesStore } from '../storage/PreferencesStore';
+import { CredentialVault, EncryptedCredential } from '../storage/CredentialVault';
+import { HuksCredentialCipher } from '../storage/HuksCredentialCipher';
+import native, { NativeEvent, NativeAuthPrompt } from 'libentry.so';
+import { picker, fileIo } from '@kit.CoreFileKit';
+import { SessionWorkspace, SessionTab } from '../terminal/SessionWorkspace';
 
 @Entry
 @Component
@@ -20,6 +29,23 @@ struct Index {
   @State private portText: string = '2222';
   @State private username: string = '';
   @State private password: string = '';
+  @State private hostName: string = '';
+  @State private hostId: string = '';
+  @State private hosts: HostProfile[] = [];
+  @State private showHosts: boolean = false;
+  @State private showCredentials: boolean = false;
+  @State private settingsReady: boolean = false;
+  @State private authMethod: AuthMethod = 'password';
+  @State private credentialId: string = '';
+  @State private credentials: EncryptedCredential[] = [];
+  @State private importingKey: boolean = false;
+  @State private forgettingTrust: boolean = false;
+  @State private preparingConnection: boolean = false;
+  @State private authChallenge: NativeEvent | null = null;
+  @State private authAnswers: string[] = [];
+  @State private identity: HostKeyInfo = new HostKeyInfo();
+  @State private tabs: SessionTab[] = [];
+  @State private activeTabId: string = '';
   @State private showConnect: boolean = true;
   @State private showPasteAuthorization: boolean = false;
   @State private showKeyboard: boolean = true;
@@ -37,54 +63,164 @@ struct Index {
   private fitTimer: number = -1;
   private pendingPaste: PasteRequestContext | null = null;
   private windowGeometryRequest: number = 0;
+  private networkMonitor: NetworkMonitor = new NetworkMonitor();
+  private repository: HostRepository | null = null;
+  private vault: CredentialVault | null = null;
+  private authTarget: SessionController | null = null;
+  private authEpoch: number = 0;
+  private connectRequest: number = 0;
+  private workspace: SessionWorkspace | null = null;
+  private pageActive: boolean = false;
+  private pageGeneration: number = 0;
+  private healthTimer: number = -1;
+  private lifecycleListener: (foreground: boolean) => void = (foreground: boolean): void => {
+    this.cancelPasteRequest();
+    if (!foreground) {
+      ++this.connectRequest;
+      this.preparingConnection = false;
+      this.password = '';
+      this.clearAuthentication();
+    }
+    this.workspace?.setForeground(foreground);
+  };
 
   aboutToAppear(): void {
+    this.pageActive = true;
+    ++this.pageGeneration;
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
-    this.session.onSnapshot = (snapshot: SessionSnapshot): void => {
-      this.snapshot = snapshot;
-      if (!snapshot.inputEnabled) {
-        this.cancelPasteRequest();
-      }
-      if (snapshot.state === ConnectionState.OPEN) {
-        this.showConnect = false;
-      } else if (snapshot.state === ConnectionState.FAILED) {
-        this.showConnect = true;
-      }
-    };
-    this.session.onHostKey = (info: HostKeyInfo): void => {
-      this.showHostKeyDialog(info);
-    };
-    this.session.onCopy = (text: string): void => {
-      this.copyText(text);
-    };
-    this.session.onPasteRequest = (): void => {
-      this.requestPasteAuthorization();
-    };
-    this.session.onAction = (action: string): void => {
-      this.handleAction(action);
-    };
-    this.session.onToast = (message: string): void => {
-      this.showToast(message);
-    };
-    this.session.input.onModifiersChanged = (modifiers: ModifierSnapshot): void => {
-      this.modifiers = modifiers;
-    };
+    const workspace = new SessionWorkspace(this.getUIContext().getHostContext()?.filesDir ?? '');
+    this.workspace = workspace;
+    workspace.onAdded = (tab: SessionTab): void => { this.attachTab(tab); };
+    workspace.onChanged = (): void => { this.refreshTabs(); };
+    workspace.create();
+    this.healthTimer = setInterval((): void => { this.workspace?.checkIdleConnections(); }, 30000);
     this.postureEngine.onChanged = (snapshot: PostureSnapshot): void => {
       this.posture = snapshot;
     };
-    this.session.initialize(this.getUIContext().getHostContext()?.filesDir ?? '');
+    this.loadSettings();
+    AppLifecycle.subscribe(this.lifecycleListener);
+    this.networkMonitor.onChanged = (available: boolean): void => { this.workspace?.setNetworkAvailable(available); };
+    this.networkMonitor.start();
     this.postureEngine.start();
     this.updateWindowGeometry();
   }
 
   aboutToDisappear(): void {
+    this.pageActive = false;
+    ++this.pageGeneration;
+    ++this.connectRequest;
+    this.clearAuthentication();
+    AppLifecycle.unsubscribe(this.lifecycleListener);
+    this.networkMonitor.stop();
     this.password = '';
     this.cancelPasteRequest();
     this.postureEngine.stop();
-    this.session.dispose();
+    this.workspace?.dispose();
+    this.workspace = null;
+    if (this.healthTimer >= 0) clearInterval(this.healthTimer);
+    this.healthTimer = -1;
     if (this.fitTimer >= 0) {
       clearTimeout(this.fitTimer);
     }
+  }
+
+  private attachTab(tab: SessionTab): void {
+    const session = tab.session;
+    session.onSnapshot = (snapshot: SessionSnapshot): void => {
+      tab.snapshot = snapshot;
+      this.refreshTabs();
+    };
+    session.onHostIdentity = (info: HostKeyInfo): void => {
+      tab.identity = info;
+      if (this.activeTabId === tab.id) this.identity = info;
+    };
+    session.onHostKey = (info: HostKeyInfo): void => {
+      if (this.workspace?.active()?.id === tab.id) this.showHostKeyDialog(info);
+      else session.disconnect();
+    };
+    session.onAuthChallenge = (event: NativeEvent): void => {
+      if (this.workspace?.active()?.id !== tab.id) { session.disconnect(); return; }
+      this.authTarget = session;
+      this.authEpoch = session.getConnectionEpoch();
+      this.authChallenge = event;
+      this.authAnswers = (event.prompts ?? []).map((_prompt: NativeAuthPrompt): string => '');
+    };
+    session.onCopy = (text: string): void => { if (this.activeTabId === tab.id) this.copyText(text); };
+    session.onPasteRequest = (): void => { if (this.activeTabId === tab.id) this.requestPasteAuthorization(); };
+    session.onAction = (action: string): void => { if (this.activeTabId === tab.id) this.handleAction(action); };
+    session.onToast = (message: string): void => { this.showToast(message); };
+    session.input.onModifiersChanged = (modifiers: ModifierSnapshot): void => {
+      if (this.activeTabId === tab.id) this.modifiers = modifiers;
+    };
+  }
+
+  private refreshTabs(): void {
+    this.tabs = this.workspace?.list() ?? [];
+    const active = this.workspace?.active();
+    if (active === null || active === undefined) return;
+    if (this.activeTabId !== active.id) {
+      this.activeTabId = active.id;
+      this.session = active.session;
+      this.backend = active.backend;
+      this.applyProfile(active.profile);
+      this.imeMode = active.imeMode;
+      this.symbolLayer = active.symbols;
+      this.identity = active.identity;
+      this.showConnect = active.snapshot.state !== ConnectionState.OPEN;
+    }
+    this.snapshot = active.snapshot;
+    this.modifiers = active.session.input.getModifiers();
+    if (!this.snapshot.inputEnabled) this.cancelPasteRequest();
+    if (this.snapshot.state !== ConnectionState.AUTHENTICATING && this.authTarget === active.session) this.clearAuthentication();
+    if (this.snapshot.state === ConnectionState.OPEN) this.showConnect = false;
+    else if (this.snapshot.state === ConnectionState.FAILED) this.showConnect = true;
+  }
+
+  private currentProfile(): HostProfile {
+    const profile = new HostProfile();
+    profile.id = this.hostId; profile.name = this.hostName; profile.host = this.host;
+    profile.port = Number(this.portText); profile.username = this.username;
+    profile.authMethod = this.authMethod; profile.credentialId = this.credentialId;
+    return profile;
+  }
+
+  private applyProfile(profile: HostProfile): void {
+    this.hostId = profile.id; this.hostName = profile.name;
+    this.host = profile.host || '127.0.0.1'; this.portText = profile.port.toString();
+    this.username = profile.username; this.authMethod = profile.authMethod; this.credentialId = profile.credentialId;
+    this.password = '';
+  }
+
+  private leaveTab(): void {
+    const active = this.workspace?.active();
+    if (active) { active.profile = this.currentProfile(); active.imeMode = this.imeMode; active.symbols = this.symbolLayer; }
+    ++this.connectRequest;
+    this.preparingConnection = false;
+    this.password = '';
+    this.cancelPasteRequest();
+    this.clearAuthentication();
+  }
+
+  private newTab(): void {
+    if (this.tabs.length >= 4) { this.showToast('最多打开四个会话标签'); return; }
+    this.leaveTab();
+    this.workspace?.create();
+  }
+
+  private selectTab(id: string): void {
+    if (id === this.activeTabId) return;
+    this.leaveTab();
+    this.workspace?.select(id);
+  }
+
+  private closeTab(id: string): void {
+    AlertDialog.show({ title: '关闭会话', message: '关闭此标签并丢弃尚未发送的输入？',
+      primaryButton: { value: '取消', action: (): void => {} },
+      secondaryButton: { value: '关闭会话', action: (): void => {
+        this.leaveTab();
+        this.workspace?.close(id);
+        if (this.tabs.length === 0) this.workspace?.create();
+      } } });
   }
 
   private updateWindowGeometry(): void {
@@ -145,22 +281,216 @@ struct Index {
     } else {
       this.postureEngine.setPreference(LayoutPreference.AUTO);
     }
+    this.savePreferences();
   }
 
-  private connect(): void {
-    const port = Number(this.portText);
+  private async loadSettings(): Promise<void> {
+    const generation = this.pageGeneration;
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) return;
     try {
-      const started = this.session.connect(this.host, port, this.username, this.password);
+      const repository = new HostRepository(await PreferencesStore.open(context, 'hterminal-settings'));
+      await repository.load();
+      if (!this.pageActive || generation !== this.pageGeneration) return;
+      this.repository = repository;
+      this.hosts = repository.list();
+      const saved = repository.preferences();
+      this.keyboardMode = saved.keyboardMode === 'full' ? KeyboardLayoutMode.FULL : KeyboardLayoutMode.COMPACT;
+      this.showKeyboard = saved.showKeyboard;
+      this.postureEngine.setPreference(saved.layout === 'laptop' ? LayoutPreference.LAPTOP :
+        saved.layout === 'normal' ? LayoutPreference.NORMAL : LayoutPreference.AUTO);
+      this.settingsReady = true;
+      try {
+        const vault = new CredentialVault(await PreferencesStore.open(context, 'hterminal-credentials'), new HuksCredentialCipher());
+        await vault.load();
+        if (!this.pageActive || generation !== this.pageGeneration) return;
+        this.vault = vault;
+        this.credentials = vault.list();
+      } catch (_error) { this.showToast('无法读取受保护凭据'); }
+    } catch (_error) { this.showToast('无法读取主机配置，原有配置不会被覆盖'); }
+  }
+
+  private savePreferences(): void {
+    if (!this.settingsReady || this.repository === null) return;
+    const saved = new UserPreferences();
+    saved.keyboardMode = this.keyboardMode;
+    saved.layout = this.posture.preference;
+    saved.showKeyboard = this.showKeyboard;
+    this.repository.savePreferences(saved).catch((): void => { this.showToast('偏好保存失败'); });
+  }
+
+  private async saveHost(): Promise<void> {
+    if (this.repository === null) return;
+    const profile = new HostProfile();
+    profile.id = this.hostId;
+    profile.name = this.hostName;
+    profile.host = this.host;
+    profile.port = Number(this.portText);
+    profile.username = this.username;
+    profile.authMethod = this.authMethod;
+    profile.credentialId = this.credentialId;
+    try {
+      const id = await this.repository.saveHost(profile);
+      this.hosts = this.repository.list();
+      this.hostId = id;
+      this.showToast('主机已保存');
+    } catch (_error) { this.showToast('保存失败，请检查主机配置和存储状态'); }
+  }
+
+  private useHost(profile: HostProfile): void {
+    if (this.snapshot.state === ConnectionState.OPEN) {
+      if (this.tabs.length >= 4) { this.showToast('请先关闭一个标签'); return; }
+      this.newTab();
+    }
+    this.hostId = profile.id;
+    this.hostName = profile.name;
+    this.host = profile.host;
+    this.portText = profile.port.toString();
+    this.username = profile.username;
+    this.authMethod = profile.authMethod;
+    this.credentialId = profile.credentialId;
+    this.password = '';
+    const active = this.workspace?.active();
+    if (active) active.profile = profile;
+    this.showHosts = false;
+    this.showConnect = true;
+  }
+
+  private deleteHost(profile: HostProfile): void {
+    AlertDialog.show({ title: '删除主机配置', message: `删除 ${profile.name}？已信任的指纹保留。`,
+      primaryButton: { value: '取消', action: (): void => {} },
+      secondaryButton: { value: '删除', action: (): void => {
+        this.repository?.deleteHost(profile.id).then((): void => {
+          this.hosts = this.repository?.list() ?? [];
+          if (this.hostId === profile.id) this.hostId = '';
+        }).catch((): void => { this.showToast('删除主机配置失败'); });
+      } }
+    });
+  }
+
+  private async connect(): Promise<void> {
+    if (this.forgettingTrust) return;
+    const port = Number(this.portText);
+    const request = ++this.connectRequest;
+    const session = this.session;
+    const epoch = session.getConnectionEpoch();
+    const host = this.host, username = this.username, password = this.password, method = this.authMethod;
+    this.preparingConnection = true;
+    const tab = this.workspace?.active();
+    if (tab) { tab.profile = this.currentProfile(); tab.identity = new HostKeyInfo(); }
+    this.identity = new HostKeyInfo();
+    let bytes = new Uint8Array(0);
+    try {
+      if (method.startsWith('publickey')) {
+        if (this.vault === null || this.credentialId.length === 0) { this.showToast('请先导入并选择 Ed25519 私钥'); return; }
+        bytes = await this.vault.read(this.credentialId);
+      }
+      if (request !== this.connectRequest || session.getConnectionEpoch() !== epoch) return;
+      const started = session.connect(host, port, username, password, method,
+        bytes.length > 0 ? ByteCodec.decodeText(ByteCodec.encodeBytes(bytes)) : '');
       if (started) {
         this.imeMode = false;
         this.cancelPasteRequest();
       }
-    } finally {
-      this.password = '';
+    } catch (_error) { this.showToast('凭据无法解锁，请检查密钥和设备状态'); }
+    finally {
+      bytes.fill(0);
+      if (request === this.connectRequest) { this.preparingConnection = false; this.password = ''; }
     }
   }
 
+  private async importKey(): Promise<void> {
+    if (this.vault === null || this.importingKey) return;
+    this.importingKey = true;
+    const passphrase = this.password;
+    const generation = this.pageGeneration;
+    let data = new Uint8Array(0);
+    try {
+      const context = this.getUIContext().getHostContext();
+      if (context === undefined) return;
+      const selected = await new picker.DocumentViewPicker(context).select({ maxSelectNumber: 1 });
+      if (selected.length === 0) return;
+      const file = fileIo.openSync(selected[0], fileIo.OpenMode.READ_ONLY);
+      try {
+        const size = fileIo.statSync(file.fd).size;
+        if (size <= 0 || size > 65536) throw new Error('密钥文件大小不受支持');
+        const buffer = new ArrayBuffer(size);
+        data = new Uint8Array(buffer);
+        const count = fileIo.readSync(file.fd, buffer);
+        if (count !== size) throw new Error('读取密钥失败');
+      } finally { fileIo.closeSync(file); }
+      const info = await native.inspectPrivateKey(ByteCodec.decodeText(ByteCodec.encodeBytes(data)), passphrase);
+      if (!this.pageActive || generation !== this.pageGeneration) return;
+      const id = await this.vault.save(this.hostName || 'Ed25519 私钥', data, info);
+      this.credentialId = id;
+      this.credentials = this.vault.list();
+      this.showToast('私钥已验证并加密保存；连接时仍需提供原文件口令');
+    } catch (_error) { this.showToast('导入失败：请选择有效的 Ed25519 私钥并填写正确口令'); }
+    finally { data.fill(0); this.password = ''; this.importingKey = false; }
+  }
+
+  private clearAuthentication(): void {
+    this.authAnswers.fill('');
+    this.authAnswers = [];
+    this.authChallenge = null;
+    this.authTarget = null;
+  }
+
+  private submitAuthentication(): void {
+    const target = this.authTarget, challenge = this.authChallenge;
+    if (target === null || challenge === null || target.getConnectionEpoch() !== this.authEpoch) {
+      this.clearAuthentication(); return;
+    }
+    try { target.answerAuthentication(challenge.requestId ?? 0, this.authAnswers); }
+    catch (_error) { target.disconnect(); this.showToast('无法提交认证回答，请重新连接'); }
+    finally { this.clearAuthentication(); }
+  }
+
+  private deleteCredential(credential: EncryptedCredential): void {
+    if (this.hosts.some((host: HostProfile): boolean => host.credentialId === credential.id &&
+      host.authMethod.startsWith('publickey')) || this.tabs.some((tab: SessionTab): boolean =>
+      tab.profile.credentialId === credential.id && [ConnectionState.CONNECTING, ConnectionState.VERIFYING_HOST,
+        ConnectionState.AUTHENTICATING, ConnectionState.OPEN].includes(tab.snapshot.state)) || this.preparingConnection) {
+      this.showToast('请先断开使用此凭据的会话，并更新主机配置'); return;
+    }
+    AlertDialog.show({ title: '删除凭据', message: `删除 ${credential.name} 的本地加密副本及保护密钥？原文件保留。`,
+      primaryButton: { value: '取消', action: (): void => {} },
+      secondaryButton: { value: '删除凭据', action: (): void => {
+        this.vault?.remove(credential.id).then((): void => {
+          this.credentials = this.vault?.list() ?? [];
+          if (this.credentialId === credential.id) this.credentialId = '';
+        }).catch((): void => { this.showToast('凭据删除失败，请重试'); });
+      } } });
+  }
+
+  private async showTrustRecord(): Promise<void> {
+    const host = this.host.trim(), port = Number(this.portText);
+    const filesDir = this.getUIContext().getHostContext()?.filesDir ?? '';
+    if (this.forgettingTrust || this.preparingConnection || this.tabs.some((tab: SessionTab): boolean =>
+      tab.session.isConnectedTo(host, port))) {
+      this.showToast('请先断开此主机的所有连接'); return;
+    }
+    this.forgettingTrust = true;
+    try {
+      const known = await native.inspectKnownHost(filesDir, host, port);
+      AlertDialog.show({ title: '已信任的主机指纹',
+        message: `${host}:${port}\n${known.fingerprint}\n\n清除后，下次连接必须重新核实服务器指纹。`,
+        autoCancel: true, cancel: (): void => { this.forgettingTrust = false; },
+        primaryButton: { value: '返回', action: (): void => { this.forgettingTrust = false; } },
+        secondaryButton: { value: '清除此指纹', action: (): void => {
+          native.forgetKnownHost(filesDir, host, port, known.fingerprint).then((): void => {
+            this.showToast('指纹记录已清除，请重新核实后连接');
+            this.identity = new HostKeyInfo();
+          }).catch((): void => { this.showToast('指纹记录已变化或无法清除'); })
+            .finally((): void => { this.forgettingTrust = false; });
+        } }
+      });
+    } catch (_error) { this.forgettingTrust = false; this.showToast('没有可用的指纹记录'); }
+  }
+
   private showHostKeyDialog(info: HostKeyInfo): void {
+    const session = this.session;
+    const epoch = session.getConnectionEpoch();
     AlertDialog.show({
       title: '验证主机密钥',
       message: `${info.host}:${info.port}\n${info.keyType}\n${info.fingerprint}\n\n仅在确认指纹与服务器一致时继续。`,
@@ -168,13 +498,13 @@ struct Index {
       primaryButton: {
         value: '拒绝',
         action: (): void => {
-          this.session.trust(false);
+          if (session.getConnectionEpoch() === epoch) session.trust(false);
         }
       },
       secondaryButton: {
         value: '信任并继续',
         action: (): void => {
-          this.session.trust(true);
+          if (session.getConnectionEpoch() === epoch) session.trust(true);
         }
       }
     });
@@ -272,6 +602,7 @@ struct Index {
   }
 
   private showToast(message: string): void {
+    if (!this.pageActive) return;
     this.getUIContext().getPromptAction().showToast({ message: message });
   }
 
@@ -282,9 +613,9 @@ struct Index {
         .fontSize(15)
         .fontWeight(FontWeight.Bold)
         .fontColor('#E5EDF5')
-      Text(this.snapshot.state)
+      Text(this.snapshot.suspended ? '输入已暂停' : this.snapshot.checking ? '检查连接' : this.snapshot.state)
         .fontSize(11)
-        .fontColor(this.snapshot.state === ConnectionState.OPEN ? '#63E6BE' : '#9AA9B8')
+        .fontColor(this.snapshot.inputEnabled ? '#63E6BE' : '#9AA9B8')
         .margin({ left: 8 })
       Text(this.posture.message)
         .fontSize(10)
@@ -292,6 +623,25 @@ struct Index {
         .margin({ left: 8 })
         .maxLines(1)
       Blank()
+      Button('主机')
+        .fontSize(11)
+        .height(28)
+        .enabled(this.settingsReady)
+        .onClick((): void => { this.showHosts = true; })
+      Button('凭据').fontSize(11).height(28).onClick((): void => { this.showCredentials = true; })
+      if (this.identity.fingerprint.length > 0) {
+        Button('指纹').fontSize(11).height(28).onClick((): void => {
+          AlertDialog.show({ title: '主机指纹',
+            message: `${this.identity.host}:${this.identity.port}\n${this.identity.keyType}\n${this.identity.fingerprint}`,
+            confirm: { value: '关闭', action: (): void => {} } });
+        })
+      }
+      if (this.snapshot.pasting) {
+        Button('停止粘贴')
+          .fontSize(11)
+          .height(28)
+          .onClick((): void => { this.session.stopPaste(false); })
+      }
       Button(this.imeMode ? '英文' : '中文')
         .fontSize(11)
         .height(28)
@@ -314,6 +664,7 @@ struct Index {
           this.keyboardMode = this.keyboardMode === KeyboardLayoutMode.FULL
             ? KeyboardLayoutMode.COMPACT : KeyboardLayoutMode.FULL;
           this.symbolLayer = false;
+          this.savePreferences();
         })
       Button(this.showKeyboard ? '隐藏键盘' : '显示键盘')
         .fontSize(11)
@@ -321,6 +672,7 @@ struct Index {
         .margin({ left: 4 })
         .onClick((): void => {
           this.showKeyboard = !this.showKeyboard;
+          this.savePreferences();
           if (!this.showKeyboard && this.imeMode) {
             this.imeMode = false;
             this.session.setImeMode(false);
@@ -385,6 +737,7 @@ struct Index {
   @Builder
   private connectOverlay() {
     Stack({ alignContent: Alignment.Center }) {
+      Scroll() {
       Column() {
         Text('连接 SSH 服务器')
           .fontSize(20)
@@ -392,6 +745,7 @@ struct Index {
           .fontColor('#E5EDF5')
           .margin({ bottom: 14 })
         TextInput({ placeholder: '主机地址', text: this.host })
+          .id('host-address')
           .height(42)
           .margin({ bottom: 8 })
           .onChange((value: string): void => {
@@ -399,6 +753,7 @@ struct Index {
           })
         Row() {
           TextInput({ placeholder: '端口', text: this.portText })
+            .id('host-port')
             .type(InputType.Number)
             .layoutWeight(1)
             .height(42)
@@ -406,6 +761,7 @@ struct Index {
               this.portText = value;
             })
           TextInput({ placeholder: '用户名', text: this.username })
+            .id('host-username')
             .layoutWeight(2)
             .height(42)
             .margin({ left: 8 })
@@ -416,12 +772,48 @@ struct Index {
         .width('100%')
         .margin({ bottom: 8 })
         TextInput({ placeholder: '密码（仅本次连接使用）', text: this.password })
+          .id('auth-secret')
           .type(InputType.Password)
           .height(42)
           .margin({ bottom: 12 })
           .onChange((value: string): void => {
             this.password = value;
           })
+        Select([{ value: '密码' }, { value: 'Ed25519 私钥' }, { value: '交互式认证' },
+          { value: '密码 + 交互式认证' }, { value: '私钥 + 交互式认证' }])
+          .id('auth-method')
+          .selected(['password', 'publickey', 'keyboard-interactive', 'password+keyboard-interactive',
+            'publickey+keyboard-interactive'].indexOf(this.authMethod))
+          .onSelect((index: number): void => {
+            const methods: AuthMethod[] = ['password', 'publickey', 'keyboard-interactive',
+              'password+keyboard-interactive', 'publickey+keyboard-interactive'];
+            this.authMethod = methods[index];
+            this.password = '';
+          })
+        if (this.authMethod.startsWith('publickey')) {
+          Text('密码框用于私钥文件口令；导入文件由设备密钥加密保护。').fontSize(11).fontColor('#9AA9B8')
+          Select(this.credentials.map((item: EncryptedCredential): SelectOption => ({ value: item.name })))
+            .selected(this.credentials.findIndex((item: EncryptedCredential): boolean => item.id === this.credentialId))
+            .onSelect((index: number): void => {
+              if (index >= 0 && index < this.credentials.length) this.credentialId = this.credentials[index].id;
+            })
+          Button(this.importingKey ? '正在导入…' : '导入 Ed25519 私钥')
+            .enabled(!this.importingKey && this.vault !== null).onClick((): void => { this.importKey(); })
+        }
+        TextInput({ placeholder: '主机名称（可选）', text: this.hostName })
+          .id('profile-name').maxLength(64)
+          .height(36)
+          .margin({ bottom: 8 })
+          .onChange((value: string): void => { this.hostName = value; })
+        Button('保存主机')
+          .id('save-host')
+          .height(32)
+          .enabled(this.settingsReady)
+          .margin({ bottom: 8 })
+          .onClick((): void => { this.saveHost(); })
+        Button(this.forgettingTrust ? '正在处理指纹…' : '信任记录')
+          .id('trust-record')
+          .height(30).enabled(!this.forgettingTrust).onClick((): void => { this.showTrustRecord(); })
         Text(this.snapshot.terminalReady || this.snapshot.state === ConnectionState.FAILED
           ? this.snapshot.message : '正在初始化终端…')
           .fontSize(12)
@@ -432,8 +824,10 @@ struct Index {
           Button(this.snapshot.state === ConnectionState.CONNECTING ||
             this.snapshot.state === ConnectionState.VERIFYING_HOST ||
             this.snapshot.state === ConnectionState.AUTHENTICATING ? '取消' : '关闭')
+            .id('connect-close')
             .layoutWeight(1)
             .onClick((): void => {
+              ++this.connectRequest;
               if (this.snapshot.state === ConnectionState.CONNECTING ||
                 this.snapshot.state === ConnectionState.VERIFYING_HOST ||
                 this.snapshot.state === ConnectionState.AUTHENTICATING) {
@@ -443,9 +837,11 @@ struct Index {
             })
           Button(!this.snapshot.terminalReady && this.snapshot.state === ConnectionState.FAILED
             ? '重新加载终端' : '连接')
+            .id('connect-submit')
             .layoutWeight(1)
             .margin({ left: 10 })
-            .enabled(this.snapshot.terminalReady || this.snapshot.state === ConnectionState.FAILED)
+            .enabled(!this.preparingConnection && !this.forgettingTrust &&
+              (this.snapshot.terminalReady || this.snapshot.state === ConnectionState.FAILED))
             .onClick((): void => {
               if (!this.snapshot.terminalReady) {
                 this.password = '';
@@ -459,11 +855,13 @@ struct Index {
         }
         .width('100%')
       }
-      .width('88%')
+      .width('100%')
       .constraintSize({ maxWidth: 520 })
       .padding(20)
       .borderRadius(12)
       .backgroundColor('#1C2835')
+      }.id('connect-form').width('88%')
+        .constraintSize({ maxWidth: 520, maxHeight: Math.max(180, this.rootHeight - 24) })
     }
     .width('100%')
     .height('100%')
@@ -473,27 +871,33 @@ struct Index {
   build() {
     Column() {
       this.topBar()
+      this.tabBar()
       Stack() {
-        TerminalView({
-          backend: this.backend,
+        ForEach(this.tabs, (tab: SessionTab) => {
+          TerminalView({
+          backend: tab.backend,
           onBridgeMessage: (json: string): void => {
-            this.session.handleTerminalMessage(json);
+            tab.session.handleTerminalMessage(json);
           },
           onFailure: (message: string): void => {
-            this.session.handleRendererFailure(message);
+            tab.session.handleRendererFailure(message);
           }
         })
+          .id(`terminal-${tab.id}`)
           .width(this.currentLayout().terminalWidth)
           .height(this.currentLayout().terminalHeight)
           .onAreaChange((_oldValue: Area, _newValue: Area): void => {
+            if (this.activeTabId !== tab.id) return;
             if (this.fitTimer >= 0) {
               clearTimeout(this.fitTimer);
             }
             this.fitTimer = setTimeout((): void => {
-              this.backend.fit();
+              if (this.activeTabId === tab.id) tab.backend.fit();
             }, 100);
           })
           .position({ x: 0, y: 0 })
+          .visibility(this.activeTabId === tab.id ? Visibility.Visible : Visibility.Hidden)
+        }, (tab: SessionTab): string => tab.id)
         if (this.currentLayout().keyboardHeight > 0) {
           LaptopKeyboard({
             mode: this.keyboardMode,
@@ -513,6 +917,15 @@ struct Index {
         }
         if (this.showConnect) {
           this.connectOverlay()
+        }
+        if (this.showHosts) {
+          this.hostsOverlay()
+        }
+        if (this.showCredentials) {
+          this.credentialsOverlay()
+        }
+        if (this.authChallenge !== null) {
+          this.authenticationOverlay()
         }
       }
       .layoutWeight(1)
@@ -534,5 +947,110 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor('#0B1016')
+  }
+
+  @Builder
+  private tabBar() {
+    Scroll() {
+      Row() {
+        ForEach(this.tabs, (tab: SessionTab) => {
+          Button() {
+            Text(`${tab.profile.name || tab.profile.host || '新会话'} · ${tab.snapshot.suspended ? '暂停' :
+              tab.snapshot.checking ? '检查连接' : tab.snapshot.state}`)
+              .fontSize(11).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }.width(150).height(28).backgroundColor(this.activeTabId === tab.id ? '#376F65' : '#263442')
+            .id(`tab-${tab.id}`)
+            .accessibilityText(`切换 ${tab.id}`).onClick((): void => { this.selectTab(tab.id); })
+          Button('×').width(26).height(28).margin({ left: 2, right: 6 })
+            .id(`close-${tab.id}`)
+            .accessibilityText(`关闭 ${tab.id}`).onClick((): void => { this.closeTab(tab.id); })
+        }, (tab: SessionTab): string => `${tab.id}-${tab.snapshot.state}-${tab.snapshot.suspended}-${tab.snapshot.checking}-${tab.profile.name}-${tab.profile.host}`)
+        Button('+').width(32).height(28).accessibilityText('新建会话')
+          .id('new-session')
+          .onClick((): void => { this.newTab(); })
+      }.padding({ left: 4, right: 4 })
+    }.width('100%').height(34).scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off)
+      .backgroundColor('#111821')
+  }
+
+  @Builder
+  private hostsOverlay() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        Text('已存主机').fontSize(20).fontColor('#E5EDF5').margin({ bottom: 12 })
+        Scroll() {
+          Column() {
+            ForEach(this.hosts, (profile: HostProfile) => {
+              Row() {
+                Button(`${profile.name} · ${profile.host}:${profile.port}`)
+                  .id(`host-${profile.id}`)
+                  .layoutWeight(1)
+                  .onClick((): void => { this.useHost(profile); })
+                Button('删除').id(`delete-${profile.id}`).margin({ left: 8 }).onClick((): void => { this.deleteHost(profile); })
+              }.width('100%').margin({ bottom: 8 })
+            }, (profile: HostProfile): string => `${profile.id}-${profile.name}-${profile.host}-${profile.port}`)
+          }.width('100%')
+        }.constraintSize({ maxHeight: 260 }).width('100%')
+        Row() {
+          Button('新建主机').onClick((): void => { this.useHost(new HostProfile()); })
+          Button('返回').margin({ left: 10 }).onClick((): void => { this.showHosts = false; })
+        }.margin({ top: 12 })
+      }.padding(20).width('88%').constraintSize({ maxWidth: 560 }).backgroundColor('#1C2835').borderRadius(12)
+    }.width('100%').height('100%').backgroundColor('#990B1016')
+  }
+
+  @Builder
+  private authenticationOverlay() {
+    Stack({ alignContent: Alignment.Center }) {
+      Scroll() {
+      Column() {
+        Text(this.authChallenge?.title || '服务器认证').fontSize(20).fontColor('#E5EDF5')
+        Text(this.authChallenge?.instruction ?? '').fontSize(12).fontColor('#9AA9B8').margin({ bottom: 8 })
+        Scroll() {
+          Column() {
+            ForEach(this.authChallenge?.prompts ?? [], (prompt: NativeAuthPrompt, index: number) => {
+              Text(prompt.text).fontSize(13).fontColor('#E5EDF5')
+              TextInput({ text: this.authAnswers[index], placeholder: '认证回答' })
+                .id(`auth-answer-${index}`)
+                .type(prompt.echo ? InputType.Normal : InputType.Password)
+                .height(40).margin({ bottom: 8 })
+                .maxLength(4096)
+                .onChange((value: string): void => { this.authAnswers[index] = value; })
+            }, (_prompt: NativeAuthPrompt, index: number): string => `${this.authChallenge?.requestId}-${index}`)
+          }
+        }.constraintSize({ maxHeight: Math.max(60, this.rootHeight - 150) }).width('100%')
+        Row() {
+          Button('取消认证').onClick((): void => { this.authTarget?.disconnect(); this.clearAuthentication(); })
+          Button('提交回答').id('auth-submit').margin({ left: 12 }).onClick((): void => { this.submitAuthentication(); })
+        }
+      }.padding(20).width('100%').borderRadius(12).backgroundColor('#1C2835')
+      }.width('88%').constraintSize({ maxWidth: 520, maxHeight: Math.max(180, this.rootHeight - 24) })
+    }.width('100%').height('100%').backgroundColor('#990B1016')
+  }
+
+  @Builder
+  private credentialsOverlay() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        Text('受保护的导入凭据').fontSize(20).fontColor('#E5EDF5')
+        Text('本地副本使用设备密钥加密；SSH 原私钥仍属于可导入文件。')
+          .fontSize(11).fontColor('#9AA9B8').margin({ bottom: 10 })
+        Scroll() {
+          Column() {
+            ForEach(this.credentials, (credential: EncryptedCredential) => {
+              Column() {
+                Text(credential.name).fontSize(15).fontColor('#E5EDF5')
+                Text(credential.fingerprint).fontSize(11).fontColor('#9AA9B8')
+                Row() {
+                  Button('复制公钥').onClick((): void => { this.copyText(credential.publicKey); })
+                  Button('删除凭据').margin({ left: 8 }).onClick((): void => { this.deleteCredential(credential); })
+                }.margin({ top: 6 })
+              }.padding(10).width('100%')
+            }, (credential: EncryptedCredential): string => credential.id)
+          }.width('100%')
+        }.constraintSize({ maxHeight: 260 }).width('100%')
+        Button('返回').onClick((): void => { this.showCredentials = false; })
+      }.width('88%').constraintSize({ maxWidth: 580 }).padding(20).backgroundColor('#1C2835').borderRadius(12)
+    }.width('100%').height('100%').backgroundColor('#990B1016')
   }
 }

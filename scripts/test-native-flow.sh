@@ -54,3 +54,35 @@ rg -q '^HT_EXIT:0' "$HT_WORK/result.log"
 "$HT_HDC" shell chmod 755 "$HT_DEVICE_DIR/session-cancel"
 "$HT_HDC" shell "$HT_DEVICE_DIR/session-cancel $HT_DEVICE_DIR; echo HT_EXIT:\$?" | tee "$HT_WORK/cancel.log"
 rg -q '^HT_EXIT:0' "$HT_WORK/cancel.log"
+
+kill "$HT_SERVER_PID"
+wait "$HT_SERVER_PID" 2>/dev/null || true
+"$HT_DEVECO/tools/node/bin/node" "$HT_ROOT/terminal/tests/ui-fixture.cjs" "$HT_PORT" > "$HT_WORK/protocol-server.log" 2>&1 &
+HT_SERVER_PID=$!
+for HT_ATTEMPT in {1..50}; do
+  if rg -q '^READY$' "$HT_WORK/protocol-server.log"; then break; fi
+  sleep 0.1
+done
+rg -q '^READY$' "$HT_WORK/protocol-server.log"
+"$HT_NATIVE/llvm/bin/clang++" --target=aarch64-linux-ohos26.0.0 \
+  --sysroot="$HT_NATIVE/sysroot" -D__MUSL__ -std=c++17 -O1 -pthread \
+  -I"$HT_ROOT/entry/src/main/cpp" -I"$HT_ROOT/third_party/install/arm64-v8a/include" \
+  "$HT_ROOT/tests/native/session-protocol.cpp" "$HT_ROOT/entry/src/main/cpp/session.cpp" \
+  "$HT_ROOT/entry/libs/arm64-v8a/libssh.so.4" "$HT_ROOT/entry/libs/arm64-v8a/libcrypto.so.3" \
+  -Wl,--wrap=ssh_channel_write -Wl,-rpath,"$HT_DEVICE_DIR" -o "$HT_WORK/session-protocol"
+"$HT_HDC" file send "$HT_WORK/session-protocol" "$HT_DEVICE_DIR/session-protocol"
+"$HT_HDC" shell mkdir -p "$HT_DEVICE_DIR/protocol"
+"$HT_HDC" shell chmod 755 "$HT_DEVICE_DIR/session-protocol"
+"$HT_HDC" shell "$HT_DEVICE_DIR/session-protocol $HT_DEVICE_DIR/protocol 10.0.2.2 $HT_PORT; echo HT_EXIT:\$?" | tee "$HT_WORK/protocol.log"
+rg -q '^HT_EXIT:0' "$HT_WORK/protocol.log"
+
+"$HT_NATIVE/llvm/bin/clang++" --target=aarch64-linux-ohos26.0.0 \
+  --sysroot="$HT_NATIVE/sysroot" -D__MUSL__ -std=c++17 -O1 -pthread \
+  -I"$HT_ROOT/entry/src/main/cpp" -I"$HT_ROOT/third_party/install/arm64-v8a/include" \
+  "$HT_ROOT/tests/native/session-multi.cpp" "$HT_ROOT/entry/src/main/cpp/session.cpp" "$HT_ROOT/entry/src/main/cpp/session_registry.cpp" \
+  "$HT_ROOT/entry/libs/arm64-v8a/libssh.so.4" "$HT_ROOT/entry/libs/arm64-v8a/libcrypto.so.3" \
+  -Wl,-rpath,"$HT_DEVICE_DIR" -o "$HT_WORK/session-multi"
+"$HT_HDC" file send "$HT_WORK/session-multi" "$HT_DEVICE_DIR/session-multi"
+"$HT_HDC" shell chmod 755 "$HT_DEVICE_DIR/session-multi"
+"$HT_HDC" shell "$HT_DEVICE_DIR/session-multi $HT_DEVICE_DIR/protocol 10.0.2.2 $HT_PORT; echo HT_EXIT:\$?" | tee "$HT_WORK/multi.log"
+rg -q '^HT_EXIT:0' "$HT_WORK/multi.log"

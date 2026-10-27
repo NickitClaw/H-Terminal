@@ -32,6 +32,7 @@ struct KeyboardKey {
     .borderRadius(4)
     .backgroundColor(this.active ? '#376F65' : '#263442')
     .enabled(this.inputEnabled)
+    .id(`key-${this.definition.id}`)
     .accessibilityText(this.definition.label)
     .onClick((): void => {
       this.onTap(this.definition);

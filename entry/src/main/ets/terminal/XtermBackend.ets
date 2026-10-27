@@ -13,6 +13,19 @@ export class XtermBackend implements TerminalBackend {
   private connectionEpoch: number = 0;
   private terminalGeneration: number = 1;
   private inputEpoch: number = 1;
+  private outputPaused: boolean = false;
+  private pausedOutput: TerminalMessage[] = [];
+  private pausedBytes: number = 0;
+
+  setOutputPaused(paused: boolean): void {
+    this.outputPaused = paused;
+    if (!paused) {
+      const pending = this.pausedOutput;
+      this.pausedOutput = [];
+      this.pausedBytes = 0;
+      for (let i = 0; i < pending.length; i++) this.send(pending[i]);
+    }
+  }
 
   setSender(sender: TerminalMessageSender): void {
     this.sender = sender;
@@ -39,6 +52,8 @@ export class XtermBackend implements TerminalBackend {
     this.bridgeEpoch++;
     this.webReady = false;
     this.pending = [];
+    this.pausedOutput = [];
+    this.pausedBytes = 0;
   }
 
   reload(): boolean {
@@ -54,6 +69,10 @@ export class XtermBackend implements TerminalBackend {
   }
 
   configure(sessionId: string, connectionEpoch: number, terminalGeneration: number, inputEpoch: number): boolean {
+    if (sessionId !== this.sessionId || connectionEpoch !== this.connectionEpoch || terminalGeneration !== this.terminalGeneration) {
+      this.pausedOutput = [];
+      this.pausedBytes = 0;
+    }
     this.sessionId = sessionId;
     this.connectionEpoch = connectionEpoch;
     this.terminalGeneration = terminalGeneration;
@@ -81,6 +100,13 @@ export class XtermBackend implements TerminalBackend {
       if (this.pending.length > 16) {
         this.pending.shift();
       }
+      return true;
+    }
+    if (message.type === 'output' && this.outputPaused) {
+      const bytes = message.byteLength ?? -1;
+      if (bytes < 0 || this.pausedBytes + bytes > 256 * 1024 || this.pausedOutput.length >= 4096) return false;
+      this.pausedOutput.push(message);
+      this.pausedBytes += bytes;
       return true;
     }
     this.sender(message);

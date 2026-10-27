@@ -20,6 +20,8 @@ export interface TerminalMessage {
   ime?: boolean;
   code?: string;
   fatal?: boolean;
+  source?: string;
+  bracketed?: boolean;
 }
 
 export interface TerminalBackend {

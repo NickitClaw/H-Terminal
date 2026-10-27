@@ -698,22 +698,12 @@
       if (bytes.byteLength === 0 && !term.modes.bracketedPasteMode) {
         return true;
       }
-      let payload = bytes;
-      if (term.modes.bracketedPasteMode) {
-        const start = encoder.encode("\x1b[200~");
-        const end = encoder.encode("\x1b[201~");
-        payload = new Uint8Array(start.length + bytes.length + end.length);
-        payload.set(start, 0);
-        payload.set(bytes, start.length);
-        payload.set(end, start.length + bytes.length);
-      }
-      return sendInput(
-        payload,
-        "utf8",
-        "paste",
-        message.inputEpoch,
-        message.eventId,
-      );
+      return post({
+        type: "paste", ...identityFields(context),
+        inputEpoch: message.inputEpoch, eventId: message.eventId,
+        bracketed: Boolean(term.modes.bracketedPasteMode),
+        byteLength: bytes.byteLength, data: base64Encode(bytes),
+      });
     } catch {
       return false;
     }
