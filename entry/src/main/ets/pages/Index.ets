@@ -135,7 +135,10 @@ struct Index {
     const session = tab.session;
     session.onReconnectRequested = (): void => {
       if (this.workspace?.active()?.id !== tab.id || !this.pageActive) { session.cancelReconnect(); return; }
-      this.applyProfile(tab.profile);
+      if (JSON.stringify(this.currentProfile()) !== JSON.stringify(tab.profile) || this.password.length > 0) {
+        session.cancelReconnect();
+        return;
+      }
       this.connect(true);
     };
     session.onSnapshot = (snapshot: SessionSnapshot): void => {

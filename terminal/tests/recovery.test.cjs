@@ -141,3 +141,28 @@ test('reconnect waits for the old write and fresh identity readiness before acce
   assert.equal(f.calls.write[0].connectionEpoch, options.connectionEpoch);
   assert.equal(Buffer.from(f.calls.write[0].data, 'base64').toString(), '\x1b[A');
 });
+
+test('initialization survives a bounded burst of controls while the Web page is loading', () => {
+  const f = fixture();
+  for (let i = 0; i < 40; i++) {
+    f.backend.fit(); f.backend.focus(false); f.backend.setFontSize(10 + i % 19);
+  }
+  assert.ok(f.backend.metrics().pendingMessages <= 16);
+  f.backend.markWebReady();
+  assert.equal(f.snapshot.terminalReady, true, 'init must not be evicted by later controls');
+  f.open();
+});
+
+test('the loading queue retains only the newest init when connections change before readiness', () => {
+  const { XtermBackend } = createEtsLoader()('entry/src/main/ets/terminal/XtermBackend.ets');
+  const backend = new XtermBackend(), messages = [];
+  backend.setSender(message => messages.push(message));
+  backend.configure('one', 1, 1, 1);
+  for (let i = 0; i < 40; i++) backend.fit();
+  backend.configure('one', 2, 2, 2);
+  for (let i = 0; i < 40; i++) backend.focus(false);
+  backend.markWebReady();
+  const inits = messages.filter(message => message.type === 'init');
+  assert.equal(messages.length, 16); assert.equal(inits.length, 1);
+  assert.equal(inits[0].connectionEpoch, 2); assert.equal(inits[0].terminalGeneration, 2);
+});

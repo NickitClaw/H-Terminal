@@ -7,7 +7,7 @@ const deferred = () => { let resolve, reject; const promise = new Promise((r, j)
 function fixture() {
   const picked = deferred(), inspected = deferred(), saved = deferred(), reads = deferred();
   const calls = { saves: [], connects: [], dialogs: [], removed: [], toasts: [], buffers: [], canceled: 0 };
-  const Page = loadPageMethods(['importKey', 'connect', 'clearAuthentication', 'submitAuthentication', 'deleteCredential', 'cancelConnectionForm', 'closeTab', 'credentialInUse', 'useHost', 'currentProfile', 'stopReconnect'], {
+  const Page = loadPageMethods(['importKey', 'connect', 'clearAuthentication', 'submitAuthentication', 'deleteCredential', 'cancelConnectionForm', 'closeTab', 'credentialInUse', 'useHost', 'currentProfile', 'stopReconnect', 'attachTab', 'applyProfile'], {
     ByteCodec, ConnectionState: { CONNECTING: 'CONNECTING', VERIFYING_HOST: 'VERIFYING_HOST', AUTHENTICATING: 'AUTHENTICATING', OPEN: 'OPEN' },
     HostProfile: class {},
     native: { inspectPrivateKey: () => inspected.promise },
@@ -157,4 +157,29 @@ test('an automatic retry without an available credential leaves no retry in prog
   assert.equal(f.calls.connects.length, 0);
   assert.equal(f.calls.canceled, 1);
   assert.equal(f.page.preparingConnection, false);
+});
+
+function attachRetry(f) {
+  f.page.password = ''; f.page.authMethod = 'password'; f.page.autoReconnect = true;
+  f.page.session.input = {};
+  const tab = { id: 'one', session: f.page.session, backend: { setFontSize() {} }, profile: f.page.currentProfile() };
+  f.page.workspace = { active: () => tab };
+  f.page.attachTab(tab);
+}
+
+test('a retry deadline cannot overwrite edited host fields or erase a newly entered secret', async () => {
+  const f = fixture(); attachRetry(f);
+  f.page.host = 'edited.test'; f.page.password = 'new-secret';
+  f.page.session.onReconnectRequested(); await flush();
+  assert.equal(f.calls.connects.length, 0);
+  assert.equal(f.page.host, 'edited.test'); assert.equal(f.page.password, 'new-secret');
+  assert.equal(f.calls.canceled, 1);
+});
+
+test('a retry with unchanged form fields still starts normally with a fresh authentication prompt', async () => {
+  const f = fixture(); attachRetry(f);
+  f.page.session.onReconnectRequested(); await flush();
+  assert.equal(f.calls.connects.length, 1);
+  assert.equal(f.calls.connects[0][0], 'host.test'); assert.equal(f.calls.connects[0][3], '');
+  assert.equal(f.calls.connects[0].at(-1), true);
 });

@@ -130,7 +130,9 @@ export class XtermBackend implements TerminalBackend {
       }
       this.pending.push(message);
       if (this.pending.length > 16) {
-        this.pending.shift();
+        // Keep the latest init: controls are unusable until it establishes
+        // the Web terminal identity and completes the ready handshake.
+        this.pending.splice(this.pending[0].type === 'init' ? 1 : 0, 1);
       }
       return true;
     }
@@ -180,7 +182,7 @@ export class XtermBackend implements TerminalBackend {
       terminalGeneration: this.terminalGeneration,
       inputEpoch: this.inputEpoch,
       eventId: eventId,
-      data: ByteCodec.encodeText(text)
+      data: ByteCodec.encodeText(text.replace(/\r?\n/g, '\r'))
     });
   }
 

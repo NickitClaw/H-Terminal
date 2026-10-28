@@ -94,3 +94,18 @@ test('authentication sends an isolated plain array to NAPI and erases the tempor
     assert.deepEqual(f.answers[0].raw, ['']);
   } finally { f.session.dispose(); }
 });
+
+test('clipboard LF and CRLF become single terminal returns with and without bracketed paste', async () => {
+  for (const bracketed of [false, true]) {
+    const f = fixture(true);
+    try {
+      f.web.terminal.modes.bracketedPasteMode = bracketed;
+      f.paste('first\nsecond\r\nthird\rfourth你好');
+      await new Promise(resolve => setImmediate(resolve));
+      const expected = 'first\rsecond\rthird\rfourth你好';
+      assert.equal(f.snapshot.pasting, false);
+      assert.equal(Buffer.concat(f.writes.map(value => Buffer.from(value.data, 'base64'))).toString(),
+        bracketed ? '\x1b[200~' + expected + '\x1b[201~' : expected);
+    } finally { f.session.dispose(); }
+  }
+});
