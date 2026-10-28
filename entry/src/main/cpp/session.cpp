@@ -44,6 +44,11 @@ std::mutex g_knownHostsMutex;
 std::once_flag g_sshInitFlag;
 int g_sshInitResult = SSH_ERROR;
 
+void UpdatePeak(std::atomic<uint64_t> &peak, uint64_t value) {
+    uint64_t previous = peak.load(std::memory_order_relaxed);
+    while (previous < value && !peak.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {}
+}
+
 void SecureClear(std::vector<uint8_t> &value) {
     volatile uint8_t *data = value.empty() ? nullptr : value.data();
     for (size_t i = 0; i < value.size(); ++i) {
@@ -75,6 +80,18 @@ std::string Base64(const uint8_t *data, size_t length) {
 bool EnsureSshInitialized() {
     std::call_once(g_sshInitFlag, []() { g_sshInitResult = ssh_init(); });
     return g_sshInitResult == SSH_OK;
+}
+
+SessionMetrics Session::Metrics() const {
+    SessionMetrics metrics;
+    metrics.outputBytes = outputBytes_.load(); metrics.inputBytes = inputBytes_.load();
+    metrics.outputFrames = outputFrames_.load(); metrics.acknowledgedFrames = acknowledgedFrames_.load();
+    metrics.unackedBytes = unackedBytes_.load(); metrics.peakUnackedBytes = peakUnackedBytes_.load();
+    metrics.peakInputBytes = peakInputBytes_.load(); metrics.peakReceiveBytes = peakReceiveBytes_.load();
+    metrics.elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - createdAt_).count();
+    std::lock_guard<std::mutex> lock(commandMutex_);
+    metrics.queuedInputBytes = queuedInputBytes_;
+    return metrics;
 }
 
 bool SupportedPrivateKeyContainer(const std::string &key) {
@@ -350,6 +367,7 @@ bool Session::WriteInput(uint64_t inputEpoch, const std::string &eventId, std::v
         command.kind = kind;
         commands_.push_back(std::move(command));
         queuedInputBytes_ += commands_.back().data.size();
+        UpdatePeak(peakInputBytes_, queuedInputBytes_);
         if (kind == InputKind::PasteStart) {
             acceptedPasteId_ = pasteId;
             acceptedPasteBrackets_ = !commands_.back().data.empty();
@@ -422,21 +440,25 @@ bool Session::SetState(PublicState state, const char *name) {
     return sink_.Emit(std::move(event));
 }
 
-void Session::EmitError(const std::string &message) {
+void Session::EmitError(const std::string &message, const std::string &code) {
     auto event = std::make_unique<NativeEvent>();
     event->type = NativeEventType::Error;
     event->sessionId = options_->sessionId;
     event->connectionEpoch = options_->connectionEpoch;
     event->terminalGeneration = options_->terminalGeneration;
     event->message = message;
+    event->code = code;
     sink_.Emit(std::move(event));
 }
 
-void Session::Fail(const std::string &message) {
+void Session::Fail(const std::string &message, const std::string &code) {
     if (failed_ || remoteClosed_ || closeRequested_.load(std::memory_order_acquire)) {
         return;
     }
     failed_ = true;
+    failureKind_ = !code.empty() ? code :
+        (stage_ == Stage::VerifyHost || stage_ == Stage::WaitTrust) ? "hostkey" :
+        (stage_ == Stage::Authenticate || stage_ == Stage::WaitAuth) ? "authentication" : "protocol";
     failureMessage_ = message;
     acceptingInput_.store(false, std::memory_order_release);
     trustPending_.store(false, std::memory_order_release);
@@ -449,7 +471,7 @@ void Session::ChangeStage(Stage stage, std::chrono::steady_clock::duration timeo
 
 void Session::CheckDeadline(const char *message) {
     if (std::chrono::steady_clock::now() >= deadline_) {
-        Fail(message);
+        Fail(message, stage_ == Stage::Connect ? "network" : "");
     }
 }
 
@@ -559,7 +581,7 @@ void Session::Run() {
     stage_ = Stage::Finished;
     if (failed_) {
         state_.store(PublicState::Failed, std::memory_order_release);
-        EmitError(failureMessage_.empty() ? "SSH session failed" : failureMessage_);
+        EmitError(failureMessage_.empty() ? "SSH session failed" : failureMessage_, failureKind_);
         SetState(PublicState::Failed, "FAILED");
     } else {
         SetState(PublicState::Closed, "CLOSED");
@@ -569,7 +591,7 @@ void Session::Run() {
 void Session::Advance() {
     if (stage_ != Stage::Connect && stage_ != Stage::Finished && stage_ != Stage::Open && session_ != nullptr &&
         !ssh_is_connected(session_) && !remoteEof_) {
-        Fail("SSH transport disconnected");
+        Fail("SSH transport disconnected", "network");
         return;
     }
     switch (stage_) {
@@ -616,7 +638,8 @@ void Session::AdvanceConnect() {
         return;
     }
     if (result != SSH_OK) {
-        Fail(handshakeDeadlineStarted_ ? "SSH handshake failed" : "SSH connection failed");
+        Fail(handshakeDeadlineStarted_ ? "SSH handshake failed" : "SSH connection failed",
+            handshakeDeadlineStarted_ ? "protocol" : "network");
         return;
     }
     CheckDeadline(handshakeDeadlineStarted_ ? "SSH handshake timed out" : "SSH connection timed out");
@@ -750,6 +773,10 @@ void Session::AdvanceAuthenticate() {
             }
             int imported = ssh_pki_import_privkey_base64(options_->privateKey.c_str(), options_->password.c_str(),
                 nullptr, nullptr, &privateKey_);
+            if (imported != SSH_OK && options_->promptForSecret && options_->password.empty() && !localSecretAsked_) {
+                if (privateKey_) { ssh_key_free(privateKey_); privateKey_ = nullptr; }
+                RequestLocalSecret("私钥文件口令"); return;
+            }
             SecureClear(options_->privateKey);
             SecureClear(options_->password);
             if (imported != SSH_OK || privateKey_ == nullptr || ssh_key_type(privateKey_) != SSH_KEYTYPE_ED25519) {
@@ -759,6 +786,9 @@ void Session::AdvanceAuthenticate() {
         }
         result = ssh_userauth_publickey(session_, nullptr, privateKey_);
     } else {
+        if (options_->promptForSecret && options_->password.empty() && !localSecretAsked_) {
+            RequestLocalSecret("本次连接密码"); return;
+        }
         result = ssh_userauth_password(session_, nullptr, options_->password.c_str());
     }
     if (result == SSH_AUTH_INFO && interactive) { RequestAuthenticationAnswers(); return; }
@@ -793,6 +823,24 @@ void Session::AdvanceAuthenticate() {
     } else {
         Fail("SSH authentication failed");
     }
+}
+
+void Session::RequestLocalSecret(const char *prompt) {
+    localSecretAsked_ = true;
+    localSecretPending_ = true;
+    promptCount_ = 1;
+    answerQueued_.store(false);
+    auto event = std::make_unique<NativeEvent>();
+    event->type = NativeEventType::AuthChallenge;
+    event->sessionId = options_->sessionId;
+    event->connectionEpoch = options_->connectionEpoch;
+    event->terminalGeneration = options_->terminalGeneration;
+    event->requestId = ++challengeId_;
+    event->title = "H-Terminal 重新认证";
+    event->instruction = "新连接需要重新认证；本次回答不会保存。旧命令不会重放。";
+    event->prompts.push_back({prompt, false});
+    ChangeStage(Stage::WaitAuth, kTrustTimeout);
+    if (!sink_.Emit(std::move(event))) Fail("native event delivery failed");
 }
 
 void Session::RequestAuthenticationAnswers() {
@@ -896,7 +944,7 @@ void Session::WaitForNetwork() {
                 transportError_ = true;
                 acceptingInput_.store(false, std::memory_order_release);
             } else {
-                Fail("SSH network polling failed");
+                Fail("SSH network polling failed", "network");
             }
         }
         return;
@@ -911,7 +959,7 @@ void Session::WaitForNetwork() {
     descriptor.events = POLLIN;
     int result = poll(&descriptor, 1, static_cast<int>(kPollInterval.count()));
     if (result < 0 && errno != EINTR) {
-        Fail("socket polling failed");
+        Fail("socket polling failed", "network");
     }
 }
 
@@ -981,6 +1029,12 @@ void Session::ApplyCommand(Command &command) {
         case CommandType::AuthAnswer:
             if (stage_ == Stage::WaitAuth && command.seq == challengeId_.load() && command.answers.size() == promptCount_) {
                 CheckDeadline("authentication prompt timed out");
+                if (!failed_ && localSecretPending_) {
+                    options_->password = std::move(command.answers[0]);
+                    localSecretPending_ = false;
+                    ChangeStage(Stage::Authenticate, kAuthenticationTimeout);
+                    break;
+                }
                 for (size_t i = 0; !failed_ && i < command.answers.size(); ++i) {
                     if (ssh_userauth_kbdint_setanswer(session_, static_cast<unsigned int>(i), command.answers[i].c_str()) < 0) {
                         Fail("could not submit authentication response");
@@ -1005,6 +1059,8 @@ void Session::ApplyAcknowledge(uint64_t seq, size_t byteLength) {
         return;
     }
     outputOutstanding_ -= byteLength;
+    unackedBytes_.store(outputOutstanding_);
+    ++acknowledgedFrames_;
     unackedFrames_.erase(found);
 }
 
@@ -1099,6 +1155,7 @@ void Session::ApplyInputReset(uint64_t epoch, bool sendControl) {
         acceptedPasteId_.clear();
         acceptedPasteBrackets_ = false;
         for (const auto &input : completion) queuedInputBytes_ += input.data.size();
+        UpdatePeak(peakInputBytes_, queuedInputBytes_);
     }
     pasteOpened_ = false;
     inputResetApplied_ = true;
@@ -1156,10 +1213,11 @@ void Session::ProcessInput() {
             break;
         }
         if (result < 0 || static_cast<size_t>(result) > remaining) {
-            Fail("SSH channel input write failed");
+            Fail("SSH channel input write failed", "network");
             return;
         }
         size_t written = static_cast<size_t>(result);
+        inputBytes_.fetch_add(written);
         size_t availableCredit = 0;
         input.offset += written;
         if (input.offset == input.data.size()) {
@@ -1230,6 +1288,10 @@ bool Session::EmitOutput(const uint8_t *data, size_t length) {
     event->data = Base64(data, length);
     unackedFrames_.push_back(UnackedFrame{seq, length});
     outputOutstanding_ += length;
+    outputBytes_.fetch_add(length);
+    ++outputFrames_;
+    unackedBytes_.store(outputOutstanding_);
+    UpdatePeak(peakUnackedBytes_, outputOutstanding_);
     if (!sink_.Emit(std::move(event))) {
         Fail("output event delivery failed");
         return false;
@@ -1284,6 +1346,7 @@ void Session::PollOutput() {
         pollStreams();
     }
     size_t buffered = available[0] + available[1];
+    UpdatePeak(peakReceiveBytes_, buffered + outputOutstanding_);
     if (outputOutstanding_ > kOutputHardLimit || buffered > kOutputHardLimit - outputOutstanding_) {
         Fail("receive queue and in-flight output exceeded the receive budget");
         return;
@@ -1300,7 +1363,7 @@ void Session::PollOutput() {
         return;
     }
     if (transportError_ && buffered == 0) {
-        Fail("SSH transport disconnected after output drained");
+        Fail("SSH transport disconnected after output drained", "network");
         return;
     }
     if (ssh_channel_is_closed(channel_) && buffered == 0) {
@@ -1366,7 +1429,7 @@ void Session::ProcessProbe() {
         probeDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     }
     if (std::chrono::steady_clock::now() >= probeDeadline_) {
-        Fail("SSH connection check timed out");
+        Fail("SSH connection check timed out", "network");
         return;
     }
     // A channel request with want-reply proves the remote endpoint responded.
@@ -1375,7 +1438,7 @@ void Session::ProcessProbe() {
     int result = ssh_channel_request_env(channel_, "HTERMINAL_CONNECTION_CHECK", "");
     if (result == SSH_AGAIN) return;
     if (result != SSH_OK && ssh_get_error_code(session_) != SSH_REQUEST_DENIED) {
-        Fail("SSH connection check failed");
+        Fail("SSH connection check failed", "network");
         return;
     }
     auto event = std::make_unique<NativeEvent>();

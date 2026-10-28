@@ -3,6 +3,12 @@ import { TerminalBackend, TerminalMessage } from './TerminalBackend';
 
 export type TerminalMessageSender = (message: TerminalMessage) => void;
 
+export class TerminalMetrics {
+  pausedBytes: number = 0;
+  pausedFrames: number = 0;
+  pendingMessages: number = 0;
+}
+
 export class XtermBackend implements TerminalBackend {
   private sender: TerminalMessageSender | null = null;
   private reloader: (() => void) | null = null;
@@ -16,6 +22,32 @@ export class XtermBackend implements TerminalBackend {
   private outputPaused: boolean = false;
   private pausedOutput: TerminalMessage[] = [];
   private pausedBytes: number = 0;
+  private fontSize: number = 15;
+
+  metrics(): TerminalMetrics {
+    const value = new TerminalMetrics();
+    value.pausedBytes = this.pausedBytes; value.pausedFrames = this.pausedOutput.length;
+    value.pendingMessages = this.pending.length;
+    return value;
+  }
+
+  setFontSize(size: number): boolean {
+    if (!Number.isInteger(size) || size < 10 || size > 28) return false;
+    this.fontSize = size;
+    return this.send({ type: 'appearance', sessionId: this.sessionId, connectionEpoch: this.connectionEpoch,
+      terminalGeneration: this.terminalGeneration, fontSize: size, fit: !this.outputPaused });
+  }
+
+  search(query: string, backward: boolean): boolean {
+    if (query.length > 256) return false;
+    return this.send({ type: 'search', sessionId: this.sessionId, connectionEpoch: this.connectionEpoch,
+      terminalGeneration: this.terminalGeneration, query: query, backward: backward });
+  }
+
+  setLocalSelection(selecting: boolean): boolean {
+    return this.send({ type: 'selection', sessionId: this.sessionId, connectionEpoch: this.connectionEpoch,
+      terminalGeneration: this.terminalGeneration, selecting: selecting });
+  }
 
   setOutputPaused(paused: boolean): void {
     this.outputPaused = paused;
@@ -83,7 +115,7 @@ export class XtermBackend implements TerminalBackend {
       connectionEpoch: connectionEpoch,
       terminalGeneration: terminalGeneration,
       inputEpoch: inputEpoch,
-      fontSize: 15,
+      fontSize: this.fontSize,
       scrollback: 5000
     });
   }

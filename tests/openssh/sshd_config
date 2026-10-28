@@ -1,0 +1,16 @@
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+PermitRootLogin no
+AllowUsers review
+AuthorizedKeysFile /etc/ssh/fixture_authorized_keys
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+PrintMotd no
+PrintLastLog no
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
+PermitTunnel no
+ForceCommand /usr/local/bin/fixture-shell

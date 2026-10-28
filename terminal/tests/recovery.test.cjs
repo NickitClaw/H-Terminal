@@ -38,7 +38,7 @@ function fixture() {
 
 test('renderer reload waits for its generation and measured size before reconnecting', () => {
   const f = fixture();
-  f.controller.handleTerminalMessage(JSON.stringify({ type: 'ready' }));
+  f.controller.handleTerminalMessage(JSON.stringify({ type: 'ready', protocolVersion: 1 }));
   assert.equal(f.snapshot.terminalReady, false);
   f.backend.markWebReady();
   assert.equal(f.snapshot.terminalReady, true);
@@ -70,7 +70,7 @@ test('renderer reload waits for its generation and measured size before reconnec
   f.controller.handleTerminalMessage(JSON.stringify({
     ...oldReady, type: 'input', inputEpoch: 1, eventId: 'late-input', data: 'WA=='
   }));
-  f.controller.handleTerminalMessage(JSON.stringify({ ...oldReady, type: 'ready' }));
+  f.controller.handleTerminalMessage(JSON.stringify({ ...oldReady, type: 'ready', protocolVersion: 1 }));
   assert.equal(f.calls.write.length, 0);
   assert.equal(f.snapshot.inputEnabled, true);
 });
@@ -103,7 +103,7 @@ test('healthy terminal cannot be reset through the failure recovery action', () 
 test('identity-scoped ready still needs valid terminal measurements', () => {
   const f = fixture();
   const identity = { sessionId: 'session-1', connectionEpoch: 0, terminalGeneration: 1 };
-  f.controller.handleTerminalMessage(JSON.stringify({ type: 'ready', ...identity }));
+  f.controller.handleTerminalMessage(JSON.stringify({ type: 'ready', protocolVersion: 1, ...identity }));
   assert.equal(f.snapshot.terminalReady, false);
   f.controller.handleTerminalMessage(JSON.stringify({ type: 'resize', ...identity, cols: 0, rows: 0 }));
   assert.equal(f.snapshot.terminalReady, false);

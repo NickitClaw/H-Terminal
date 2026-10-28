@@ -24,6 +24,8 @@ export class RoutedInput {
 
 export class InputRouter {
   onModifiersChanged: (modifiers: ModifierSnapshot) => void = (_modifiers: ModifierSnapshot): void => {};
+  onInvalidated: () => void = (): void => {};
+  private held: Map<number, string> = new Map<number, string>();
   private sessionId: string = '';
   private connectionEpoch: number = 0;
   private inputEpoch: number = 1;
@@ -47,7 +49,29 @@ export class InputRouter {
     result.shift = this.modifiers.shift;
     result.fn = this.modifiers.fn;
     result.caps = this.modifiers.caps;
+    this.held.forEach((name: string): void => {
+      if (name === 'ctrl') result.ctrl = true;
+      else if (name === 'alt' || name === 'altgr') result.alt = true;
+      else if (name === 'shift') result.shift = true;
+      else if (name === 'fn') result.fn = true;
+    });
     return result;
+  }
+
+  holdModifier(pointer: number, id: string): void {
+    this.held.set(pointer, id);
+    this.emitModifiers();
+  }
+
+  releaseModifier(pointer: number): void {
+    if (this.held.delete(pointer)) this.emitModifiers();
+  }
+
+  clearStickyModifiers(): void {
+    this.modifiers.ctrl = false; this.modifiers.alt = false; this.modifiers.shift = false; this.modifiers.fn = false;
+    this.ctrlLocked = false; this.altLocked = false; this.shiftLocked = false; this.fnLocked = false;
+    this.lastModifier = '';
+    this.emitModifiers();
   }
 
   beginSession(sessionId: string, connectionEpoch: number): void {
@@ -58,6 +82,8 @@ export class InputRouter {
 
   invalidate(): void {
     this.inputEpoch++;
+    this.onInvalidated();
+    this.held.clear();
     this.modifiers = new ModifierSnapshot();
     this.ctrlLocked = false;
     this.altLocked = false;
@@ -81,9 +107,10 @@ export class InputRouter {
     routed.inputEpoch = this.inputEpoch;
     this.eventCounter++;
     routed.eventId = `${this.inputEpoch}-${this.eventCounter}`;
-    routed.ctrl = this.modifiers.ctrl;
-    routed.alt = this.modifiers.alt;
-    routed.shift = this.modifiers.shift;
+    const effective = this.getModifiers();
+    routed.ctrl = effective.ctrl;
+    routed.alt = effective.alt;
+    routed.shift = effective.shift;
 
     if (definition.kind === 'action') {
       routed.kind = 'action';
@@ -98,7 +125,7 @@ export class InputRouter {
       this.afterKey();
       return routed;
     }
-    if (this.modifiers.fn) {
+    if (effective.fn) {
       const mapped = InputRouter.mapFn(definition.id);
       if (mapped.length > 0) {
         routed.kind = 'key';
@@ -111,7 +138,7 @@ export class InputRouter {
       routed.kind = 'key';
       routed.key = definition.id;
     } else {
-      const text = this.resolveText(definition);
+      const text = this.resolveText(definition, effective);
       if (routed.ctrl || routed.alt) {
         routed.kind = 'key';
         routed.key = text;
@@ -127,9 +154,9 @@ export class InputRouter {
     return routed;
   }
 
-  private resolveText(definition: KeyDefinition): string {
+  private resolveText(definition: KeyDefinition, effective: ModifierSnapshot): string {
     const isLetter = definition.output.length === 1 && definition.output >= 'a' && definition.output <= 'z';
-    const shifted = isLetter ? (this.modifiers.shift !== this.modifiers.caps) : this.modifiers.shift;
+    const shifted = isLetter ? (effective.shift !== effective.caps) : effective.shift;
     return shifted && definition.shiftOutput.length > 0 ? definition.shiftOutput : definition.output;
   }
 

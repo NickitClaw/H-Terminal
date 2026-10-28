@@ -200,7 +200,7 @@ void DispatchEvent(napi_env env, napi_value callback, void *context, void *data)
                 break;
             case NativeEventType::Error:
                 ok = SetString(env, object, "type", "error") &&
-                    SetString(env, object, "message", event->message);
+                    SetString(env, object, "message", event->message) && SetString(env, object, "code", event->code);
                 break;
             case NativeEventType::InputCredit:
                 ok = SetString(env, object, "type", "inputCredit") &&
@@ -312,6 +312,13 @@ bool OptionalStringProperty(napi_env env, napi_value object, const char *name, s
         (type == napi_undefined || ReadString(env, property, value, maximum));
 }
 
+bool OptionalBoolProperty(napi_env env, napi_value object, const char *name, bool &value) {
+    napi_value property = nullptr;
+    napi_valuetype type = napi_undefined;
+    return ReadProperty(env, object, name, property) && napi_typeof(env, property, &type) == napi_ok &&
+        (type == napi_undefined || napi_get_value_bool(env, property, &value) == napi_ok);
+}
+
 bool ContainsNul(const std::string &value) {
     return value.find('\0') != std::string::npos;
 }
@@ -331,6 +338,7 @@ std::unique_ptr<NativeConnectOptions> ParseConnectOptions(napi_env env, napi_val
         StringProperty(env, value, "password", options->password, kMaxInputBytes) &&
         OptionalStringProperty(env, value, "authMethod", options->authMethod, 48) &&
         OptionalStringProperty(env, value, "privateKey", options->privateKey, kMaxInputBytes) &&
+        OptionalBoolProperty(env, value, "promptForSecret", options->promptForSecret) &&
         NumberProperty(env, value, "cols", cols) && NumberProperty(env, value, "rows", rows);
     if (!ok || options->sessionId.empty() || options->filesDir.empty() || options->filesDir[0] != '/' ||
         options->host.empty() || options->username.empty() || port == 0 || port > 65535 || cols == 0 ||
@@ -423,6 +431,26 @@ napi_value ResetInput(napi_env env, napi_callback_info info) {
     auto session = Manager::Instance().Find(id, epoch);
     if (session) session->ResetInput(inputEpoch, sendControl);
     return Undefined(env);
+}
+
+napi_value GetSessionMetrics(napi_env env, napi_callback_info info) {
+    std::vector<napi_value> args;
+    std::string id; uint64_t epoch = 0;
+    if (!Arguments(env, info, 2, args) || !ReadString(env, args[0], id, 128) || id.empty() || !ReadNumber(env, args[1], epoch)) {
+        napi_throw_error(env, "H-Terminal", "invalid metrics identity"); return Undefined(env);
+    }
+    auto session = Manager::Instance().Find(id, epoch);
+    if (!session) { napi_throw_error(env, "H-Terminal", "session is unavailable"); return Undefined(env); }
+    const SessionMetrics metrics = session->Metrics();
+    napi_value object = nullptr;
+    bool ok = napi_create_object(env, &object) == napi_ok &&
+        SetNumber(env, object, "outputBytes", metrics.outputBytes) && SetNumber(env, object, "inputBytes", metrics.inputBytes) &&
+        SetNumber(env, object, "outputFrames", metrics.outputFrames) && SetNumber(env, object, "acknowledgedFrames", metrics.acknowledgedFrames) &&
+        SetNumber(env, object, "unackedBytes", metrics.unackedBytes) && SetNumber(env, object, "peakUnackedBytes", metrics.peakUnackedBytes) &&
+        SetNumber(env, object, "peakInputBytes", metrics.peakInputBytes) && SetNumber(env, object, "peakReceiveBytes", metrics.peakReceiveBytes) &&
+        SetNumber(env, object, "queuedInputBytes", metrics.queuedInputBytes) && SetNumber(env, object, "elapsedMs", metrics.elapsedMs);
+    if (!ok) { napi_throw_error(env, "H-Terminal", "could not create metrics"); return Undefined(env); }
+    return object;
 }
 
 napi_value AnswerAuthentication(napi_env env, napi_callback_info info) {
@@ -667,7 +695,10 @@ napi_value WriteInput(napi_env env, napi_callback_info info) {
     }
     std::string phase, pasteId;
     InputKind kind = InputKind::Normal;
-    if (StringProperty(env, args[0], "pastePhase", phase, 16) && !phase.empty()) {
+    if (!OptionalStringProperty(env, args[0], "pastePhase", phase, 16)) {
+        napi_throw_error(env, "H-Terminal", "invalid paste phase"); return Undefined(env);
+    }
+    if (!phase.empty()) {
         if (!StringProperty(env, args[0], "pasteId", pasteId, 128) || pasteId.empty()) {
             napi_throw_error(env, "H-Terminal", "invalid paste transaction");
             return Undefined(env);
@@ -769,6 +800,7 @@ napi_value Register(napi_env env, napi_value exports) {
         {"probeSession", nullptr, Safely<ProbeSession>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resetInput", nullptr, Safely<ResetInput>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"answerAuthentication", nullptr, Safely<AnswerAuthentication>, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getSessionMetrics", nullptr, Safely<GetSessionMetrics>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"inspectPrivateKey", nullptr, Safely<InspectPrivateKey>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"inspectKnownHost", nullptr, Safely<TrustedHostKeyOperation<false>>, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"forgetKnownHost", nullptr, Safely<TrustedHostKeyOperation<true>>, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -1,5 +1,6 @@
 import { ModifierSnapshot } from '../input/InputRouter';
 import { KeyDefinition, KeyboardLayoutMode, KeyboardModel, KeyboardRow } from '../input/KeyboardModel';
+import { KeyContact } from '../input/KeyboardInteraction';
 
 @Component
 struct KeyboardKey {
@@ -7,6 +8,30 @@ struct KeyboardKey {
   @Prop active: boolean = false;
   @Prop inputEnabled: boolean = true;
   onTap: (definition: KeyDefinition) => void = (_definition: KeyDefinition): void => {};
+  onPress: (definition: KeyDefinition, pointer: number) => KeyContact | null =
+    (_definition: KeyDefinition, _pointer: number): KeyContact | null => null;
+  private contacts: Map<number, KeyContact> = new Map<number, KeyContact>();
+  private keyWidth: number = 0;
+  private keyHeight: number = 0;
+
+  aboutToDisappear(): void {
+    this.contacts.forEach((contact: KeyContact): void => { contact.release(true); });
+    this.contacts.clear();
+  }
+
+  private touch(event: TouchEvent): void {
+    if (event.source !== SourceType.TouchScreen) return;
+    for (let point of event.changedTouches) {
+      if (event.type === TouchType.Down) {
+        const contact = this.onPress(this.definition, point.id);
+        if (contact !== null) this.contacts.set(point.id, contact);
+      } else if (event.type === TouchType.Up || event.type === TouchType.Cancel ||
+        (event.type === TouchType.Move && (point.x < 0 || point.y < 0 || point.x > this.keyWidth || point.y > this.keyHeight))) {
+        this.contacts.get(point.id)?.release(event.type !== TouchType.Up);
+        this.contacts.delete(point.id);
+      }
+    }
+  }
 
   build() {
     Button({ type: ButtonType.Normal }) {
@@ -34,8 +59,14 @@ struct KeyboardKey {
     .enabled(this.inputEnabled)
     .id(`key-${this.definition.id}`)
     .accessibilityText(this.definition.label)
-    .onClick((): void => {
-      this.onTap(this.definition);
+    .onAreaChange((_old: Area, area: Area): void => {
+      this.keyWidth = Number(area.width); this.keyHeight = Number(area.height);
+    })
+    .onTouch((event: TouchEvent): void => { this.touch(event); })
+    .onClick((event: ClickEvent): void => {
+      // Touch is handled on Down/Up; keyboard and accessibility activation
+      // still use Click. Never send the trailing click after a touch repeat.
+      if (event.source !== SourceType.TouchScreen) this.onTap(this.definition);
     })
   }
 }
@@ -47,6 +78,8 @@ export struct LaptopKeyboard {
   @Prop inputEnabled: boolean = true;
   @Prop modifiers: ModifierSnapshot = new ModifierSnapshot();
   onKey: (definition: KeyDefinition) => void = (_definition: KeyDefinition): void => {};
+  onPress: (definition: KeyDefinition, pointer: number) => KeyContact | null =
+    (_definition: KeyDefinition, _pointer: number): KeyContact | null => null;
 
   private isActive(definition: KeyDefinition): boolean {
     if (definition.kind !== 'modifier') {
@@ -76,7 +109,8 @@ export struct LaptopKeyboard {
               definition: definition,
               active: this.isActive(definition),
               inputEnabled: this.inputEnabled,
-              onTap: this.onKey
+              onTap: this.onKey,
+              onPress: this.onPress
             })
           }, (definition: KeyDefinition, keyIndex: number): string => `${rowIndex}-${keyIndex}-${definition.id}`)
         }

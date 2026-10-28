@@ -10,9 +10,12 @@
   const MAX_MESSAGE_LENGTH = 1500000;
   const encoder = new TextEncoder();
   const terminalHost = document.getElementById("terminal");
+  const selectionHost = document.getElementById("local-selection");
 
   let term = null;
   let fitAddon = null;
+  let searchAddon = null;
+  let selecting = false;
   let helperTextarea = null;
   let context = null;
   let currentInputEpoch = 0;
@@ -145,10 +148,13 @@
   }
 
   function sendCopy(inputEpoch, eventId) {
-    if (!term || !context || !term.hasSelection()) {
+    if (!term || !context || (!selecting && !term.hasSelection())) {
       return;
     }
-    const bytes = encoder.encode(term.getSelection());
+    const text = selecting ? (window.getSelection()?.toString() ?? "") : term.getSelection();
+    if (text.length === 0) return;
+    const bytes = encoder.encode(text);
+    if (bytes.byteLength > MAX_INPUT_BYTES) return;
     post({
       type: "copy",
       ...identityFields(context),
@@ -377,6 +383,7 @@
   }
 
   function recreateTerminal(fontSize, scrollback) {
+    setLocalSelection(false);
     if (term) {
       term.dispose();
     }
@@ -403,6 +410,8 @@
     });
     fitAddon = new window.FitAddon.FitAddon();
     term.loadAddon(fitAddon);
+    searchAddon = new window.SearchAddon.SearchAddon({ highlightLimit: 1000 });
+    term.loadAddon(searchAddon);
     term.open(terminalHost);
     helperTextarea = terminalHost.querySelector(".xterm-helper-textarea");
     configureTextarea(false, false);
@@ -430,7 +439,7 @@
       return false;
     });
     term.onData((data) => {
-      if (!suppressXtermInput && context) {
+      if (!selecting && !suppressXtermInput && context) {
         sendInput(
           encoder.encode(data),
           "utf8",
@@ -441,7 +450,7 @@
       }
     });
     term.onBinary((data) => {
-      if (suppressXtermInput || !context) {
+      if (selecting || suppressXtermInput || !context) {
         return;
       }
       const bytes = new Uint8Array(data.length);
@@ -450,6 +459,32 @@
       }
       sendInput(bytes, "binary", "onBinary", currentInputEpoch, nextEventId());
     });
+  }
+
+  function setLocalSelection(enabled) {
+    selecting = enabled;
+    if (!selectionHost) return;
+    if (enabled && term) {
+      // Freeze a bounded plain-text snapshot, so touch selection works even
+      // when the remote TUI enabled mouse reporting. No remote HTML is used.
+      const lines = [];
+      let chars = 0;
+      const buffer = term.buffer.active;
+      for (let i = buffer.length - 1; i >= 0; i--) {
+        const line = buffer.getLine(i).translateToString(true);
+        if (chars + line.length + 1 > 256 * 1024) break;
+        chars += line.length + 1;
+        lines.push(line);
+      }
+      selectionHost.textContent = lines.reverse().join("\n");
+      selectionHost.style.fontSize = `${term.options.fontSize}px`;
+      configureTextarea(false, false);
+    } else {
+      selectionHost.textContent = "";
+      window.getSelection?.()?.removeAllRanges();
+    }
+    selectionHost.hidden = !enabled;
+    terminalHost.style.visibility = enabled ? "hidden" : "";
   }
 
   function failOutput(code) {
@@ -722,22 +757,40 @@
     if (!message || typeof message !== "object" || Array.isArray(message)) {
       return false;
     }
-    if (resetAfterWrite && ["key", "text", "paste", "copy", "fit", "focus", "clear"].includes(message.type)) {
+    if (resetAfterWrite && ["key", "text", "paste", "copy", "fit", "focus", "clear", "appearance", "search", "selection"].includes(message.type)) {
       return false;
     }
 
     try {
       switch (message.type) {
+        case "appearance":
+          if (!matchesCurrentContext(message, true) || !Number.isInteger(message.fontSize) || message.fontSize < 10 || message.fontSize > 28) return false;
+          term.options.fontSize = message.fontSize;
+          if (selectionHost) selectionHost.style.fontSize = `${message.fontSize}px`;
+          return message.fit === false || fitTerminal(true);
+        case "selection":
+          if (!matchesCurrentContext(message, true) || typeof message.selecting !== "boolean") return false;
+          setLocalSelection(message.selecting);
+          return true;
+        case "search": {
+          if (!matchesCurrentContext(message, true) || selecting || typeof message.query !== "string" || message.query.length > 256) return false;
+          const matched = message.query.length > 0 && (message.backward === true
+            ? searchAddon.findPrevious(message.query, { regex: false })
+            : searchAddon.findNext(message.query, { regex: false }));
+          if (!message.query) searchAddon.clearDecorations();
+          post({ type: "searchResult", ...identityFields(context), matched: Boolean(matched) });
+          return true;
+        }
         case "init":
           return handleInit(message);
         case "output":
           return handleOutput(message);
         case "key":
-          return handleKey(message);
+          return !selecting && handleKey(message);
         case "text":
-          return handleText(message);
+          return !selecting && handleText(message);
         case "paste":
-          return handlePaste(message);
+          return !selecting && handlePaste(message);
         case "copy":
           if (!matchesCurrentContext(message, false)) {
             return false;
@@ -795,5 +848,16 @@
     }
   }, true);
   window.open = () => null;
-  window.HTerminal = Object.freeze({ receive });
+  function drain() {
+    if (typeof window.HTerminalBridge?.takeMessage !== "function") return 0;
+    let count = 0;
+    while (count < 8) {
+      const message = window.HTerminalBridge.takeMessage();
+      if (typeof message !== "string" || message.length === 0) break;
+      receive(message);
+      count++;
+    }
+    return count;
+  }
+  window.HTerminal = Object.freeze({ receive, drain });
 })();

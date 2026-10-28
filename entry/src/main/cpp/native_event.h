@@ -28,6 +28,7 @@ struct NativeConnectOptions {
     std::string password;
     std::string authMethod = "password";
     std::string privateKey;
+    bool promptForSecret = false;
     int cols = 0;
     int rows = 0;
 
@@ -67,6 +68,7 @@ struct NativeEvent {
     size_t byteLength = 0;
     std::string data;
     std::string message;
+    std::string code;
     std::string host;
     uint32_t port = 0;
     std::string keyType;

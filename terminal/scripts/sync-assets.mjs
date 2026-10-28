@@ -23,6 +23,13 @@ const packages = [
     ],
   },
   {
+    name: "@xterm/addon-search",
+    assets: [
+      ["lib/addon-search.js", "addon-search.js"],
+      ["LICENSE", "LICENSE.addon-search"],
+    ],
+  },
+  {
     name: "@xterm/addon-fit",
     assets: [
       ["lib/addon-fit.js", "addon-fit.js"],

@@ -22,6 +22,13 @@ export interface TerminalMessage {
   fatal?: boolean;
   source?: string;
   bracketed?: boolean;
+  fit?: boolean;
+  query?: string;
+  backward?: boolean;
+  matched?: boolean;
+  selecting?: boolean;
+  protocolVersion?: number;
+  encoding?: string;
 }
 
 export interface TerminalBackend {

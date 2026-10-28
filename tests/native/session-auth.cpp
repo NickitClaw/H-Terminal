@@ -9,10 +9,19 @@ struct AuthSink final : NativeEventSink {
     std::shared_ptr<Session> session;
     std::atomic<bool> opened{false}, failed{false};
     size_t rounds = 0;
+    size_t localRounds = 0;
+    std::string localAnswer = "review";
     bool cancel = false, wrongAnswer = false, promptsValid = true;
     bool Emit(std::unique_ptr<NativeEvent> event) override {
         if (event->type == NativeEventType::HostKey) session->TrustDecision(true);
         if (event->type == NativeEventType::AuthChallenge) {
+            if (event->title == "H-Terminal 重新认证") {
+                ++localRounds;
+                promptsValid = promptsValid && event->prompts.size() == 1 && !event->prompts[0].echo;
+                if (cancel) session->RequestClose();
+                else session->AnswerAuthentication(event->requestId, {localAnswer});
+                return true;
+            }
             ++rounds;
             if (rounds == 1) promptsValid = event->prompts.size() == 2 && event->prompts[0].echo && !event->prompts[1].echo;
             else promptsValid = promptsValid && event->prompts.size() == 1 && !event->prompts[0].echo;
@@ -31,13 +40,16 @@ struct AuthSink final : NativeEventSink {
 };
 
 bool Run(const char *dir, const char *host, uint32_t port, const std::string &method, const std::string &file,
-         const std::string &password, bool reject = false, bool cancel = false) {
+         const std::string &password, bool reject = false, bool cancel = false, bool prompt = false,
+         const std::string &answer = "") {
     AuthSink sink; sink.cancel = cancel; sink.wrongAnswer = reject && method == "keyboard-interactive";
+    sink.localAnswer = !answer.empty() ? answer : file == "encrypted-identity" ? "key-passphrase" : "review";
     auto options = std::make_unique<NativeConnectOptions>();
     options->sessionId = "auth"; options->connectionEpoch = 1; options->terminalGeneration = 1;
     options->filesDir = dir; options->host = host; options->port = port;
     options->username = method.find('+') != std::string::npos ? "combo" : "review";
     options->password = password; options->authMethod = method; options->cols = 80; options->rows = 24;
+    options->promptForSecret = prompt;
     if (!file.empty()) {
         std::ifstream input(std::string(dir) + "/" + file);
         options->privateKey.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
@@ -51,8 +63,9 @@ bool Run(const char *dir, const char *host, uint32_t port, const std::string &me
     sink.session->RequestClose(); sink.session->Stop();
     bool interactive = method.find("keyboard-interactive") != std::string::npos;
     bool ok = reject ? sink.failed.load() && !sink.opened.load() :
-        cancel ? !sink.opened.load() && sink.rounds == 1 : sink.opened.load();
+        cancel ? !sink.opened.load() && sink.rounds + sink.localRounds == 1 : sink.opened.load();
     if (interactive && !reject && !cancel) ok = ok && sink.rounds == 2 && sink.promptsValid;
+    if (prompt && !cancel && !reject) ok = ok && sink.localRounds == 1 && sink.promptsValid;
     printf("%s: %s %s %s rounds=%zu\n", ok ? "PASS" : "FAIL", method.c_str(), file.c_str(),
         reject ? "reject" : cancel ? "cancel" : "authenticate", sink.rounds);
     return ok;
@@ -78,6 +91,12 @@ int main(int argc, char **argv) {
     ok &= Run(argv[1], argv[2], port, "publickey+keyboard-interactive", "identity", "");
     ok &= Run(argv[1], argv[2], port, "keyboard-interactive", "", "", true);
     ok &= Run(argv[1], argv[2], port, "keyboard-interactive", "", "", false, true);
+    ok &= Run(argv[1], argv[2], port, "password", "", "", false, false, true);
+    ok &= Run(argv[1], argv[2], port, "publickey", "encrypted-identity", "", false, false, true);
+    ok &= Run(argv[1], argv[2], port, "password+keyboard-interactive", "", "", false, false, true);
+    ok &= Run(argv[1], argv[2], port, "publickey+keyboard-interactive", "encrypted-identity", "", false, false, true);
+    ok &= Run(argv[1], argv[2], port, "password", "", "", true, false, true, "wrong");
+    ok &= Run(argv[1], argv[2], port, "password", "", "", false, true, true);
     TrustedHostKey known, checked;
     bool trust = AccessTrustedHostKey(argv[1], argv[2], port, "", false, known);
     trust = trust && !AccessTrustedHostKey(argv[1], argv[2], port, "SHA256:stale", true, checked);

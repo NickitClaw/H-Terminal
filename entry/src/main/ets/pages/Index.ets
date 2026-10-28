@@ -7,6 +7,7 @@ import { SessionController } from '../terminal/SessionController';
 import { InputRouter, ModifierSnapshot } from '../input/InputRouter';
 import { KeyDefinition, KeyboardLayoutMode } from '../input/KeyboardModel';
 import { PasteRequestContext } from '../input/PasteRequestContext';
+import { KeyContact } from '../input/KeyboardInteraction';
 import { LaptopKeyboard } from '../components/LaptopKeyboard';
 import { LayoutPreference, PostureEngine, PostureSnapshot } from '../posture/PostureEngine';
 import { LayoutCoordinator, LayoutResult } from '../posture/LayoutCoordinator';
@@ -36,9 +37,11 @@ struct Index {
   @State private showCredentials: boolean = false;
   @State private settingsReady: boolean = false;
   @State private authMethod: AuthMethod = 'password';
+  @State private autoReconnect: boolean = false;
   @State private credentialId: string = '';
   @State private credentials: EncryptedCredential[] = [];
   @State private importingKey: boolean = false;
+  @State private importStatus: string = '选择文件…';
   @State private forgettingTrust: boolean = false;
   @State private preparingConnection: boolean = false;
   @State private authChallenge: NativeEvent | null = null;
@@ -57,6 +60,9 @@ struct Index {
   @State private rootWidth: number = 0;
   @State private rootHeight: number = 0;
   @State private rootGlobalY: number = 0;
+  @State private showTerminalTools: boolean = false;
+  @State private fontSize: number = 15;
+  @State private searchText: string = '';
   private backend: XtermBackend = new XtermBackend();
   private session: SessionController = new SessionController(this.backend);
   private postureEngine: PostureEngine = new PostureEngine();
@@ -125,7 +131,13 @@ struct Index {
   }
 
   private attachTab(tab: SessionTab): void {
+    tab.backend.setFontSize(this.fontSize);
     const session = tab.session;
+    session.onReconnectRequested = (): void => {
+      if (this.workspace?.active()?.id !== tab.id || !this.pageActive) { session.cancelReconnect(); return; }
+      this.applyProfile(tab.profile);
+      this.connect(true);
+    };
     session.onSnapshot = (snapshot: SessionSnapshot): void => {
       tab.snapshot = snapshot;
       this.refreshTabs();
@@ -181,6 +193,7 @@ struct Index {
     profile.id = this.hostId; profile.name = this.hostName; profile.host = this.host;
     profile.port = Number(this.portText); profile.username = this.username;
     profile.authMethod = this.authMethod; profile.credentialId = this.credentialId;
+    profile.autoReconnect = this.autoReconnect;
     return profile;
   }
 
@@ -188,10 +201,13 @@ struct Index {
     this.hostId = profile.id; this.hostName = profile.name;
     this.host = profile.host || '127.0.0.1'; this.portText = profile.port.toString();
     this.username = profile.username; this.authMethod = profile.authMethod; this.credentialId = profile.credentialId;
+    this.autoReconnect = profile.autoReconnect;
     this.password = '';
   }
 
   private leaveTab(): void {
+    this.showTerminalTools = false;
+    this.searchText = '';
     const active = this.workspace?.active();
     if (active) { active.profile = this.currentProfile(); active.imeMode = this.imeMode; active.symbols = this.symbolLayer; }
     ++this.connectRequest;
@@ -214,10 +230,12 @@ struct Index {
   }
 
   private closeTab(id: string): void {
+    const workspace = this.workspace, generation = this.pageGeneration;
     AlertDialog.show({ title: '关闭会话', message: '关闭此标签并丢弃尚未发送的输入？',
       primaryButton: { value: '取消', action: (): void => {} },
       secondaryButton: { value: '关闭会话', action: (): void => {
-        this.leaveTab();
+        if (!this.pageActive || generation !== this.pageGeneration || workspace !== this.workspace) return;
+        if (id === this.activeTabId) this.leaveTab();
         this.workspace?.close(id);
         if (this.tabs.length === 0) this.workspace?.create();
       } } });
@@ -297,6 +315,8 @@ struct Index {
       const saved = repository.preferences();
       this.keyboardMode = saved.keyboardMode === 'full' ? KeyboardLayoutMode.FULL : KeyboardLayoutMode.COMPACT;
       this.showKeyboard = saved.showKeyboard;
+      this.fontSize = saved.fontSize;
+      this.tabs.forEach((tab: SessionTab): void => { tab.backend.setFontSize(this.fontSize); });
       this.postureEngine.setPreference(saved.layout === 'laptop' ? LayoutPreference.LAPTOP :
         saved.layout === 'normal' ? LayoutPreference.NORMAL : LayoutPreference.AUTO);
       this.settingsReady = true;
@@ -316,11 +336,13 @@ struct Index {
     saved.keyboardMode = this.keyboardMode;
     saved.layout = this.posture.preference;
     saved.showKeyboard = this.showKeyboard;
+    saved.fontSize = this.fontSize;
     this.repository.savePreferences(saved).catch((): void => { this.showToast('偏好保存失败'); });
   }
 
   private async saveHost(): Promise<void> {
     if (this.repository === null) return;
+    const tabId = this.activeTabId, generation = this.pageGeneration;
     const profile = new HostProfile();
     profile.id = this.hostId;
     profile.name = this.hostName;
@@ -329,10 +351,12 @@ struct Index {
     profile.username = this.username;
     profile.authMethod = this.authMethod;
     profile.credentialId = this.credentialId;
+    profile.autoReconnect = this.autoReconnect;
     try {
       const id = await this.repository.saveHost(profile);
+      if (!this.pageActive || generation !== this.pageGeneration) return;
       this.hosts = this.repository.list();
-      this.hostId = id;
+      if (tabId === this.activeTabId && JSON.stringify(this.currentProfile()) === JSON.stringify(profile)) this.hostId = id;
       this.showToast('主机已保存');
     } catch (_error) { this.showToast('保存失败，请检查主机配置和存储状态'); }
   }
@@ -349,6 +373,7 @@ struct Index {
     this.username = profile.username;
     this.authMethod = profile.authMethod;
     this.credentialId = profile.credentialId;
+    this.autoReconnect = profile.autoReconnect;
     this.password = '';
     const active = this.workspace?.active();
     if (active) active.profile = profile;
@@ -368,8 +393,21 @@ struct Index {
     });
   }
 
-  private async connect(): Promise<void> {
+  private async connect(automatic: boolean = false, confirmed: boolean = false): Promise<void> {
     if (this.forgettingTrust) return;
+    if (!automatic) {
+      this.session.cancelReconnect();
+      if (!confirmed && this.session.getConnectionEpoch() > 0) {
+        const target = this.session, epoch = target.getConnectionEpoch(), request = ++this.connectRequest;
+        AlertDialog.show({ title: '重新连接将重置终端',
+          message: '新连接会重置本地屏幕与终端模式，不恢复旧 Shell，也不会重放旧命令。可先返回查看断线前输出；远端工作区可通过 tmux 恢复。',
+          primaryButton: { value: '返回查看', action: (): void => {} },
+          secondaryButton: { value: '重置终端并连接', action: (): void => {
+            if (this.pageActive && request === this.connectRequest && target === this.session && epoch === target.getConnectionEpoch()) this.connect(false, true);
+          } } });
+        return;
+      }
+    }
     const port = Number(this.portText);
     const request = ++this.connectRequest;
     const session = this.session;
@@ -386,30 +424,46 @@ struct Index {
         bytes = await this.vault.read(this.credentialId);
       }
       if (request !== this.connectRequest || session.getConnectionEpoch() !== epoch) return;
+      session.setAutoReconnect(this.autoReconnect);
       const started = session.connect(host, port, username, password, method,
-        bytes.length > 0 ? ByteCodec.decodeText(ByteCodec.encodeBytes(bytes)) : '');
+        bytes.length > 0 ? ByteCodec.decodeText(ByteCodec.encodeBytes(bytes)) : '', automatic);
       if (started) {
         this.imeMode = false;
         this.cancelPasteRequest();
       }
-    } catch (_error) { this.showToast('凭据无法解锁，请检查密钥和设备状态'); }
+    } catch (_error) { session.cancelReconnect(); this.showToast('凭据无法解锁，请检查密钥和设备状态'); }
     finally {
       bytes.fill(0);
       if (request === this.connectRequest) { this.preparingConnection = false; this.password = ''; }
     }
   }
 
+  private cancelConnectionForm(): void {
+    ++this.connectRequest;
+    this.preparingConnection = false;
+    this.password = '';
+    this.session.cancelReconnect();
+    if ([ConnectionState.CONNECTING, ConnectionState.VERIFYING_HOST, ConnectionState.AUTHENTICATING].includes(this.snapshot.state)) {
+      this.session.disconnect();
+    }
+    this.showConnect = false;
+  }
+
   private async importKey(): Promise<void> {
     if (this.vault === null || this.importingKey) return;
     this.importingKey = true;
+    this.importStatus = '选择文件…';
     const passphrase = this.password;
+    this.password = '';
     const generation = this.pageGeneration;
+    const tabId = this.activeTabId, name = this.hostName || 'Ed25519 私钥';
     let data = new Uint8Array(0);
     try {
       const context = this.getUIContext().getHostContext();
       if (context === undefined) return;
       const selected = await new picker.DocumentViewPicker(context).select({ maxSelectNumber: 1 });
-      if (selected.length === 0) return;
+      if (selected.length === 0 || !this.pageActive || generation !== this.pageGeneration || tabId !== this.activeTabId) return;
+      this.importStatus = '验证私钥…';
       const file = fileIo.openSync(selected[0], fileIo.OpenMode.READ_ONLY);
       try {
         const size = fileIo.statSync(file.fd).size;
@@ -420,13 +474,18 @@ struct Index {
         if (count !== size) throw new Error('读取密钥失败');
       } finally { fileIo.closeSync(file); }
       const info = await native.inspectPrivateKey(ByteCodec.decodeText(ByteCodec.encodeBytes(data)), passphrase);
+      if (!this.pageActive || generation !== this.pageGeneration || tabId !== this.activeTabId) return;
+      this.importStatus = '加密保存…';
+      const id = await this.vault.save(name, data, info);
       if (!this.pageActive || generation !== this.pageGeneration) return;
-      const id = await this.vault.save(this.hostName || 'Ed25519 私钥', data, info);
-      this.credentialId = id;
+      if (tabId === this.activeTabId) this.credentialId = id;
       this.credentials = this.vault.list();
       this.showToast('私钥已验证并加密保存；连接时仍需提供原文件口令');
-    } catch (_error) { this.showToast('导入失败：请选择有效的 Ed25519 私钥并填写正确口令'); }
-    finally { data.fill(0); this.password = ''; this.importingKey = false; }
+    } catch (error) {
+      console.error(`Key import failed phase=${this.importStatus} code=${(error as BusinessError).code ?? 0}`);
+      this.showToast('导入失败：请选择有效的 Ed25519 私钥并填写正确口令');
+    }
+    finally { data.fill(0); this.importingKey = false; }
   }
 
   private clearAuthentication(): void {
@@ -447,20 +506,28 @@ struct Index {
   }
 
   private deleteCredential(credential: EncryptedCredential): void {
-    if (this.hosts.some((host: HostProfile): boolean => host.credentialId === credential.id &&
-      host.authMethod.startsWith('publickey')) || this.tabs.some((tab: SessionTab): boolean =>
-      tab.profile.credentialId === credential.id && [ConnectionState.CONNECTING, ConnectionState.VERIFYING_HOST,
-        ConnectionState.AUTHENTICATING, ConnectionState.OPEN].includes(tab.snapshot.state)) || this.preparingConnection) {
+    if (this.credentialInUse(credential.id)) {
       this.showToast('请先断开使用此凭据的会话，并更新主机配置'); return;
     }
+    const generation = this.pageGeneration, vault = this.vault;
     AlertDialog.show({ title: '删除凭据', message: `删除 ${credential.name} 的本地加密副本及保护密钥？原文件保留。`,
       primaryButton: { value: '取消', action: (): void => {} },
       secondaryButton: { value: '删除凭据', action: (): void => {
-        this.vault?.remove(credential.id).then((): void => {
-          this.credentials = this.vault?.list() ?? [];
+        if (!this.pageActive || generation !== this.pageGeneration || vault !== this.vault) return;
+        if (this.credentialInUse(credential.id)) { this.showToast('请先断开使用此凭据的会话，并更新主机配置'); return; }
+        vault?.remove(credential.id).then((): void => {
+          if (!this.pageActive || generation !== this.pageGeneration || vault !== this.vault) return;
+          this.credentials = vault?.list() ?? [];
           if (this.credentialId === credential.id) this.credentialId = '';
         }).catch((): void => { this.showToast('凭据删除失败，请重试'); });
       } } });
+  }
+
+  private credentialInUse(id: string): boolean {
+    return this.hosts.some((host: HostProfile): boolean => host.credentialId === id &&
+      host.authMethod.startsWith('publickey')) || this.tabs.some((tab: SessionTab): boolean =>
+      tab.profile.credentialId === id && (tab.snapshot.retrying || [ConnectionState.CONNECTING, ConnectionState.VERIFYING_HOST,
+        ConnectionState.AUTHENTICATING, ConnectionState.OPEN].includes(tab.snapshot.state))) || this.preparingConnection;
   }
 
   private async showTrustRecord(): Promise<void> {
@@ -629,6 +696,13 @@ struct Index {
         .enabled(this.settingsReady)
         .onClick((): void => { this.showHosts = true; })
       Button('凭据').fontSize(11).height(28).onClick((): void => { this.showCredentials = true; })
+      Button('终端').id('terminal-tools').fontSize(11).height(28).onClick((): void => {
+        this.session.setImeMode(false); this.imeMode = false; this.cancelPasteRequest(); this.showTerminalTools = true;
+      })
+      if (this.snapshot.retrying) {
+        Button('停止重连').id('stop-reconnect').fontSize(11).height(28)
+          .onClick((): void => { this.session.cancelReconnect(); })
+      }
       if (this.identity.fingerprint.length > 0) {
         Button('指纹').fontSize(11).height(28).onClick((): void => {
           AlertDialog.show({ title: '主机指纹',
@@ -782,6 +856,9 @@ struct Index {
         Select([{ value: '密码' }, { value: 'Ed25519 私钥' }, { value: '交互式认证' },
           { value: '密码 + 交互式认证' }, { value: '私钥 + 交互式认证' }])
           .id('auth-method')
+          .value(this.authMethod === 'password' ? '密码' : this.authMethod === 'publickey' ? 'Ed25519 私钥' :
+            this.authMethod === 'keyboard-interactive' ? '交互式认证' :
+            this.authMethod === 'password+keyboard-interactive' ? '密码 + 交互式认证' : '私钥 + 交互式认证')
           .selected(['password', 'publickey', 'keyboard-interactive', 'password+keyboard-interactive',
             'publickey+keyboard-interactive'].indexOf(this.authMethod))
           .onSelect((index: number): void => {
@@ -793,11 +870,14 @@ struct Index {
         if (this.authMethod.startsWith('publickey')) {
           Text('密码框用于私钥文件口令；导入文件由设备密钥加密保护。').fontSize(11).fontColor('#9AA9B8')
           Select(this.credentials.map((item: EncryptedCredential): SelectOption => ({ value: item.name })))
+            .id('credential-select')
+            .value(this.credentials.find((item: EncryptedCredential): boolean => item.id === this.credentialId)?.name ?? '选择凭据')
             .selected(this.credentials.findIndex((item: EncryptedCredential): boolean => item.id === this.credentialId))
             .onSelect((index: number): void => {
               if (index >= 0 && index < this.credentials.length) this.credentialId = this.credentials[index].id;
             })
-          Button(this.importingKey ? '正在导入…' : '导入 Ed25519 私钥')
+          Button(this.importingKey ? this.importStatus : '导入 Ed25519 私钥')
+            .id('credential-import')
             .enabled(!this.importingKey && this.vault !== null).onClick((): void => { this.importKey(); })
         }
         TextInput({ placeholder: '主机名称（可选）', text: this.hostName })
@@ -805,6 +885,14 @@ struct Index {
           .height(36)
           .margin({ bottom: 8 })
           .onChange((value: string): void => { this.hostName = value; })
+        Row({ space: 12 }) {
+          Text('断线自动重连').fontSize(13).fontColor('#E5EDF5')
+          Toggle({ type: ToggleType.Switch, isOn: this.autoReconnect }).id('auto-reconnect')
+            .onChange((enabled: boolean): void => { this.autoReconnect = enabled; this.session.setAutoReconnect(enabled); })
+        }.margin({ bottom: 8 })
+        if (this.autoReconnect) {
+          Text('只重试网络故障，最多 5 次。新连接重置屏幕，需重新认证，不重放命令。').fontSize(11).fontColor('#9AA9B8')
+        }
         Button('保存主机')
           .id('save-host')
           .height(32)
@@ -827,13 +915,7 @@ struct Index {
             .id('connect-close')
             .layoutWeight(1)
             .onClick((): void => {
-              ++this.connectRequest;
-              if (this.snapshot.state === ConnectionState.CONNECTING ||
-                this.snapshot.state === ConnectionState.VERIFYING_HOST ||
-                this.snapshot.state === ConnectionState.AUTHENTICATING) {
-                this.session.disconnect();
-              }
-              this.showConnect = false;
+              this.cancelConnectionForm();
             })
           Button(!this.snapshot.terminalReady && this.snapshot.state === ConnectionState.FAILED
             ? '重新加载终端' : '连接')
@@ -906,6 +988,9 @@ struct Index {
             modifiers: this.modifiers,
             onKey: (definition: KeyDefinition): void => {
               this.session.routeKey(definition);
+            },
+            onPress: (definition: KeyDefinition, pointer: number): KeyContact | null => {
+              return this.session.keyboard.press(definition, pointer);
             }
           })
             .width(this.currentLayout().keyboardWidth)
@@ -923,6 +1008,9 @@ struct Index {
         }
         if (this.showCredentials) {
           this.credentialsOverlay()
+        }
+        if (this.showTerminalTools) {
+          this.terminalToolsOverlay()
         }
         if (this.authChallenge !== null) {
           this.authenticationOverlay()
@@ -1000,6 +1088,53 @@ struct Index {
   }
 
   @Builder
+  private terminalToolsOverlay() {
+    Stack({ alignContent: Alignment.Center }) {
+      Scroll() {
+        Column({ space: 12 }) {
+          Text('终端工具').fontSize(20).fontColor('#E5EDF5')
+          Row({ space: 12 }) {
+            Button('A−').id('font-smaller').enabled(this.fontSize > 10).onClick((): void => { this.changeFontSize(-1); })
+            Text(`字号 ${this.fontSize}`).id('font-value').fontColor('#E5EDF5')
+            Button('A+').id('font-larger').enabled(this.fontSize < 28).onClick((): void => { this.changeFontSize(1); })
+          }
+          TextInput({ placeholder: '搜索当前会话输出', text: this.searchText }).id('terminal-search')
+            .maxLength(256).onChange((value: string): void => { this.searchText = value; })
+          Row({ space: 12 }) {
+            Button('上一个').id('search-previous').enabled(!this.snapshot.selecting)
+              .onClick((): void => { this.backend.search(this.searchText, true); })
+            Button('下一个').id('search-next').enabled(!this.snapshot.selecting)
+              .onClick((): void => { this.backend.search(this.searchText, false); })
+            Button('复制选区').onClick((): void => { this.backend.send({ type: 'copy' }); })
+          }
+          Button(this.snapshot.selecting ? '返回实时终端' : '本地选择（快照）').id('local-selection')
+            .onClick((): void => { this.session.setLocalSelection(!this.snapshot.selecting); this.showTerminalTools = false; })
+          Text('本地选择显示最近输出的只读快照；返回实时终端后继续输入。').fontSize(12).fontColor('#9AA9B8')
+          Button('tmux 使用示例').onClick((): void => {
+            AlertDialog.show({ title: '断线后恢复工作区',
+              message: '在服务器运行 tmux new -As work。Ctrl+B 后按 D 可离开；重新连接后再次运行同一命令即可恢复。示例仅复制，由你决定是否执行。',
+              primaryButton: { value: '关闭', action: (): void => {} },
+              secondaryButton: { value: '复制示例', action: (): void => { this.copyText('tmux new -As work'); } } });
+          })
+          Button('诊断信息').id('session-diagnostics').onClick((): void => {
+            const report = this.session.diagnostics();
+            AlertDialog.show({ title: '会话诊断', message: report,
+              primaryButton: { value: '关闭诊断', action: (): void => {} },
+              secondaryButton: { value: '复制诊断', action: (): void => { this.copyText(report); } } });
+          })
+          Button('关闭工具').id('terminal-tools-close').onClick((): void => { this.showTerminalTools = false; })
+        }.padding(20).width('100%').backgroundColor('#1C2835').borderRadius(12)
+      }.width('88%').constraintSize({ maxWidth: 560, maxHeight: Math.max(180, this.rootHeight - 24) })
+    }.width('100%').height('100%').backgroundColor('#990B1016')
+  }
+
+  private changeFontSize(delta: number): void {
+    this.fontSize = Math.max(10, Math.min(28, this.fontSize + delta));
+    this.tabs.forEach((tab: SessionTab): void => { tab.backend.setFontSize(this.fontSize); });
+    this.savePreferences();
+  }
+
+  @Builder
   private authenticationOverlay() {
     Stack({ alignContent: Alignment.Center }) {
       Scroll() {
@@ -1020,7 +1155,7 @@ struct Index {
           }
         }.constraintSize({ maxHeight: Math.max(60, this.rootHeight - 150) }).width('100%')
         Row() {
-          Button('取消认证').onClick((): void => { this.authTarget?.disconnect(); this.clearAuthentication(); })
+          Button('取消认证').id('auth-cancel').onClick((): void => { this.authTarget?.disconnect(); this.clearAuthentication(); })
           Button('提交回答').id('auth-submit').margin({ left: 12 }).onClick((): void => { this.submitAuthentication(); })
         }
       }.padding(20).width('100%').borderRadius(12).backgroundColor('#1C2835')
@@ -1043,7 +1178,8 @@ struct Index {
                 Text(credential.fingerprint).fontSize(11).fontColor('#9AA9B8')
                 Row() {
                   Button('复制公钥').onClick((): void => { this.copyText(credential.publicKey); })
-                  Button('删除凭据').margin({ left: 8 }).onClick((): void => { this.deleteCredential(credential); })
+                  Button('删除凭据').id(`credential-delete-${credential.id}`).margin({ left: 8 })
+                    .onClick((): void => { this.deleteCredential(credential); })
                 }.margin({ top: 6 })
               }.padding(10).width('100%')
             }, (credential: EncryptedCredential): string => credential.id)

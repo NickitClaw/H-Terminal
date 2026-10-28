@@ -46,6 +46,7 @@ function createTerminalHarness(onMessage = () => {}) {
       this.modes = { applicationCursorKeysMode: false, bracketedPasteMode: false };
       this.cols = 80;
       this.rows = 24;
+      this.buffer = { active: { length: 1, getLine: () => ({ translateToString: () => 'fixture <script>你好🙂</script>' }) } };
       terminal = this;
     }
     loadAddon() {} open() {} dispose() {} focus() {} clear() {}
@@ -57,11 +58,20 @@ function createTerminalHarness(onMessage = () => {}) {
   }
   const host = {
     clientWidth: 800, clientHeight: 600, addEventListener() {},
+    style: {},
     querySelector: () => ({ blur() {}, setAttribute() {} })
   };
+  const selectionHost = { style: {}, textContent: '', hidden: true };
+  const searches = [];
   const window = {
     Terminal: FakeTerminal,
     FitAddon: { FitAddon: class { fit() {} } },
+    SearchAddon: { SearchAddon: class {
+      findNext(query, options) { searches.push({ query, options, backward: false }); return query === 'fixture'; }
+      findPrevious(query, options) { searches.push({ query, options, backward: true }); return query === 'fixture'; }
+      clearDecorations() {}
+    } },
+    getSelection: () => ({ toString: () => selectionHost.textContent, removeAllRanges() {} }),
     HTerminalBridge: { postMessage: (json) => {
       const message = JSON.parse(json);
       messages.push(message);
@@ -70,14 +80,16 @@ function createTerminalHarness(onMessage = () => {}) {
   };
   vm.runInNewContext(fs.readFileSync(path.join(projectRoot,
     'entry/src/main/resources/rawfile/terminal/terminal.js'), 'utf8'), {
-    window, document: { getElementById: () => host, addEventListener() {} },
+    window, document: { getElementById: id => id === 'local-selection' ? selectionHost : host, addEventListener() {} },
     TextEncoder, TextDecoder, Uint8Array,
     btoa: (text) => Buffer.from(text, 'binary').toString('base64'),
     atob: (text) => Buffer.from(text, 'base64').toString('binary')
   });
   return {
-    messages, writes,
+    messages, writes, selectionHost, searches,
     receive: (message) => window.HTerminal.receive(JSON.stringify(message)),
+    setInbox: (take) => { window.HTerminalBridge.takeMessage = take; },
+    drain: () => window.HTerminal.drain(),
     get terminal() { return terminal; }
   };
 }

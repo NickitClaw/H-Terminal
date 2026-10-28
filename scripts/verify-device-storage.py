@@ -76,3 +76,5 @@ finally:
     with zipfile.ZipFile(artifact) as package:
         assert all(marker.encode() not in package.read(name) for name in package.namelist()
                    if name.endswith(('.abc', '.map'))), 'temporary probe remains in the restored artifact'
+    run(['./scripts/sign-debug.sh', 'entry/build/default/outputs/default/entry-default-unsigned.hap'], 'sign-restored')
+    run([hdc, 'install', '-r', '.runtime/signing/H-Terminal-signed.hap'], 'install-restored')

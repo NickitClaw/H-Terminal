@@ -5,13 +5,14 @@ const { privateKey } = generateKeyPairSync('rsa', {
   publicKeyEncoding: { type: 'pkcs1', format: 'pem' }
 });
 let sequence = 0;
+let dropped = false;
 new Server({ hostKeys: [privateKey] }, (client) => {
   const id = ++sequence;
   let username = '';
   client.on('error', () => {});
   client.on('authentication', (request) => {
     username = request.username;
-    if (request.method === 'password' && ['review', 'probe-reject', 'probe-timeout'].includes(username) &&
+    if (request.method === 'password' && ['review', 'soak', 'probe-reject', 'probe-timeout'].includes(username) &&
       request.password === 'review') request.accept();
     else request.reject(['password']);
   });
@@ -32,12 +33,34 @@ new Server({ hostKeys: [privateKey] }, (client) => {
     });
     session.on('shell', (accept) => {
       const stream = accept();
+      let pumping = false, timer, chunk = 0;
+      const pump = () => {
+        if (!pumping || stream.destroyed) return;
+        const line = `HT_STREAM ${id} ${String(++chunk).padStart(10, '0')} ${'X'.repeat(80)}\r\n`;
+        const data = line.repeat(Math.floor(32768 / Buffer.byteLength(line)));
+        if (stream.write(data)) timer = setTimeout(pump, 256);
+        else stream.once('drain', () => { timer = setTimeout(pump, 256); });
+      };
+      if (username === 'soak') { pumping = true; timer = setTimeout(pump, 300); }
+      stream.on('close', () => { pumping = false; clearTimeout(timer); });
       stream.on('error', () => {});
       stream.write('fixture> ');
       console.log(`OPEN ${id}`);
+      if (process.env.HT_UI_SCENARIO === 'reconnect' && !dropped) {
+        dropped = true;
+        setTimeout(() => client.end(), 1500);
+      }
       stream.on('data', (bytes) => {
         // Only artificial local test input. Authentication secrets are never logged.
         console.log(`INPUT ${id} ${bytes.toString('base64')}`);
+        if (username === 'soak') {
+          console.log(`TIMING ${id} ${Date.now()} ${bytes.toString('base64')}`);
+          if (bytes.includes(3)) { pumping = false; clearTimeout(timer); console.log(`STOP ${id} ${Date.now()}`); }
+          if (bytes.equals(Buffer.from('r')) && !pumping) { pumping = true; timer = setTimeout(pump, 256); }
+        }
+        if (process.env.HT_UI_SCENARIO === 'reconnect' && bytes.equals(Buffer.from([4]))) {
+          setTimeout(() => client.end(), 100);
+        }
         stream.write(bytes);
       });
     });

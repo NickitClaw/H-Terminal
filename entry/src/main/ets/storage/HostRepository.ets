@@ -2,6 +2,7 @@ export type AuthMethod = 'password' | 'publickey' | 'keyboard-interactive' |
   'password+keyboard-interactive' | 'publickey+keyboard-interactive';
 
 export class HostProfile {
+  autoReconnect: boolean = false;
   id: string = '';
   name: string = '';
   host: string = '';
@@ -12,6 +13,7 @@ export class HostProfile {
 }
 
 export class UserPreferences {
+  fontSize: number = 15;
   keyboardMode: string = 'compact';
   layout: string = 'auto';
   showKeyboard: boolean = true;
@@ -123,12 +125,14 @@ export class HostRepository {
     clean.name = source.name.trim() || `${clean.username}@${clean.host}`.substring(0, 64);
     clean.authMethod = source.authMethod;
     clean.credentialId = source.credentialId;
+    clean.autoReconnect = source.autoReconnect === true;
     return clean;
   }
 
   private static cleanPreferences(source: UserPreferences): UserPreferences {
     const clean = new UserPreferences();
     if (source !== null && source !== undefined) {
+      if (Number.isInteger(source.fontSize) && source.fontSize >= 10 && source.fontSize <= 28) clean.fontSize = source.fontSize;
       clean.keyboardMode = source.keyboardMode === 'full' ? 'full' : 'compact';
       clean.layout = ['auto', 'laptop', 'normal'].includes(source.layout) ? source.layout : 'auto';
       clean.showKeyboard = source.showKeyboard !== false;

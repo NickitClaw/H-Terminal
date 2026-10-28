@@ -21,6 +21,8 @@ export class TerminalSize {
 }
 
 export class SessionSnapshot {
+  retrying: boolean = false;
+  selecting: boolean = false;
   state: ConnectionState = ConnectionState.IDLE;
   message: string = '尚未连接';
   terminalReady: boolean = false;

@@ -2,6 +2,8 @@ import native, { NativeAck, NativeConnectOptions, NativeEvent, NativeInputReques
 import { BusinessError } from '@kit.BasicServicesKit';
 import { HostKeyInfo, ConnectionState, SessionSnapshot, TerminalSize } from '../model/SessionModel';
 import { InputRouter } from '../input/InputRouter';
+import { KeyboardInteraction } from '../input/KeyboardInteraction';
+import { ReconnectPolicy } from '../lifecycle/ReconnectPolicy';
 import { KeyDefinition } from '../input/KeyboardModel';
 import { ByteCodec } from '../util/ByteCodec';
 import { PasteTransaction } from '../input/PasteTransaction';
@@ -52,6 +54,7 @@ export class SessionController {
   private pasteTransaction: PasteTransaction | null = null;
   private inputResetPending: boolean = false;
   private selected: boolean = true;
+  private selecting: boolean = false;
   private connectedHost: string = '';
   private connectedPort: number = 0;
   private lastActivity: number = Date.now();
@@ -59,6 +62,31 @@ export class SessionController {
   constructor(backend: XtermBackend, sessionId: string = 'session-1') {
     this.backend = backend;
     this.sessionId = sessionId;
+    this.keyboard = new KeyboardInteraction(this.input, (key: KeyDefinition): void => { this.routeKey(key); },
+      (): boolean => this.snapshot.inputEnabled);
+    this.reconnect.onRetry = (): void => { this.onReconnectRequested(); };
+    this.reconnect.onScheduled = (attempt: number, delay: number): void => {
+      this.publish(ConnectionState.FAILED, `网络连接已断开，${Math.ceil(delay / 1000)} 秒后重连（${attempt}/5）。新连接将重置终端，不重放命令。`);
+    };
+  }
+
+  readonly keyboard: KeyboardInteraction;
+  private reconnect: ReconnectPolicy = new ReconnectPolicy();
+  onReconnectRequested: () => void = (): void => {};
+
+  setAutoReconnect(enabled: boolean): void {
+    this.reconnect.configure(enabled);
+    if (this.snapshot.retrying !== this.reconnect.pending()) this.publish(this.snapshot.state, this.snapshot.message);
+  }
+  cancelReconnect(): void {
+    const pending = this.reconnect.pending();
+    this.reconnect.stop();
+    if (pending) this.publish(this.snapshot.state, '已停止自动重连，请手动连接');
+  }
+
+  private updateReconnectAvailability(): void {
+    this.reconnect.setAvailable(this.initialized && this.selected && this.foreground && this.networkAvailable &&
+      this.snapshot.terminalReady && !this.rendererFailed);
   }
 
   getSessionId(): string {
@@ -70,6 +98,22 @@ export class SessionController {
   }
 
   getSnapshot(): SessionSnapshot { return this.snapshot; }
+  diagnostics(): string {
+    // Explicit projection: do not serialize controllers, events or profiles.
+    const backend = this.backend.metrics();
+    let metrics: string = 'null';
+    try {
+      const m = native.getSessionMetrics(this.sessionId, this.connectionEpoch);
+      metrics = JSON.stringify({ outputBytes: m.outputBytes, inputBytes: m.inputBytes, outputFrames: m.outputFrames,
+        acknowledgedFrames: m.acknowledgedFrames, unackedBytes: m.unackedBytes, peakUnackedBytes: m.peakUnackedBytes,
+        peakInputBytes: m.peakInputBytes, peakReceiveBytes: m.peakReceiveBytes, queuedInputBytes: m.queuedInputBytes,
+        elapsedMs: m.elapsedMs });
+    } catch (_error) {}
+    return `{"connectionEpoch":${this.connectionEpoch},"terminalGeneration":${this.terminalGeneration},` +
+      `"inputEpoch":${this.input.getInputEpoch()},"state":"${this.snapshot.state}",` +
+      `"pendingInputBytes":${this.pendingInputBytes},"pausedOutputBytes":${backend.pausedBytes},` +
+      `"pausedOutputFrames":${backend.pausedFrames},"native":${metrics}}`;
+  }
   isConnectedTo(host: string, port: number): boolean {
     return this.attemptActive && this.connectedHost.toLowerCase() === host.trim().toLowerCase() && this.connectedPort === port;
   }
@@ -92,7 +136,8 @@ export class SessionController {
   }
 
   connect(host: string, port: number, username: string, password: string,
-    authMethod: string = 'password', privateKey: string = ''): boolean {
+    authMethod: string = 'password', privateKey: string = '', automatic: boolean = false): boolean {
+    if (!automatic) this.reconnect.stop();
     if (!this.initialized) return false;
     if (!this.foreground || !this.networkAvailable || !this.selected) {
       this.onToast('请返回前台并确认网络可用');
@@ -116,6 +161,7 @@ export class SessionController {
     const initialCols = this.terminalSize.cols;
     const initialRows = this.terminalSize.rows;
     this.clearPendingInputs();
+    this.selecting = false;
     this.connectionEpoch++;
     this.input.beginSession(this.sessionId, this.connectionEpoch);
     // A new identity may wait for the previous xterm.write callback before
@@ -138,7 +184,8 @@ export class SessionController {
       cols: initialCols,
       rows: initialRows,
       authMethod: authMethod,
-      privateKey: privateKey
+      privateKey: privateKey,
+      promptForSecret: automatic
     };
     this.attemptActive = true;
     this.connectedHost = normalizedHost;
@@ -157,6 +204,8 @@ export class SessionController {
   }
 
   disconnect(): void {
+    if (!this.initialized) return;
+    this.reconnect.stop();
     this.clearProbe();
     this.attemptActive = false;
     if (this.connectionEpoch > 0) {
@@ -168,7 +217,7 @@ export class SessionController {
   }
 
   trust(accepted: boolean): void {
-    if (this.snapshot.state !== ConnectionState.VERIFYING_HOST) {
+    if (!this.initialized || !this.attemptActive || this.snapshot.state !== ConnectionState.VERIFYING_HOST) {
       return;
     }
     native.trustDecision(this.sessionId, this.connectionEpoch, accepted);
@@ -238,6 +287,15 @@ export class SessionController {
     this.backend.focus(enabled);
   }
 
+  setLocalSelection(enabled: boolean): void {
+    if (!this.snapshot.terminalReady) return;
+    this.stopPaste(false);
+    if (this.backend.setLocalSelection(enabled)) {
+      this.selecting = enabled;
+      this.publish(this.snapshot.state, enabled ? '只读输出快照，返回实时终端后可输入' : this.snapshot.state);
+    }
+  }
+
   setForeground(foreground: boolean): void {
     if (this.foreground === foreground) return;
     this.foreground = foreground;
@@ -289,14 +347,14 @@ export class SessionController {
     this.probeTimer = setTimeout((): void => {
       if (this.checking && request === this.probeCounter) {
         native.closeSession(this.sessionId, this.connectionEpoch);
-        this.markFailed('连接检查超时，请手动重连');
+        this.markFailed('连接检查超时', 'network');
       }
     }, 10000);
     try {
       native.probeSession(this.sessionId, this.connectionEpoch, request);
     } catch (_error) {
       native.closeSession(this.sessionId, this.connectionEpoch);
-      this.markFailed('无法检查连接，请手动重连');
+      this.markFailed('无法检查连接', 'network');
     }
   }
 
@@ -323,11 +381,11 @@ export class SessionController {
   }
 
   handleRendererFailure(message: string): void {
-    this.failRenderer(message);
+    if (this.initialized) this.failRenderer(message);
   }
 
   recoverTerminal(): boolean {
-    if (!this.rendererFailed) {
+    if (!this.initialized || !this.rendererFailed) {
       return false;
     }
     this.backend.markWebNotReady();
@@ -348,17 +406,19 @@ export class SessionController {
   }
 
   handleTerminalMessage(json: string): void {
+    if (!this.initialized || typeof json !== 'string' || json.length > 1500000) return;
     let message: TerminalMessage;
     try {
       message = JSON.parse(json) as TerminalMessage;
     } catch (_error) {
       return;
     }
+    if (message === null || typeof message !== 'object' || Array.isArray(message) || typeof message.type !== 'string') return;
     if (this.rendererFailed) {
       return;
     }
     if (message.type === 'ready') {
-      if (!this.isCurrentTerminalMessage(message)) {
+      if (!this.isCurrentTerminalMessage(message) || message.protocolVersion !== 1) {
         return;
       }
       this.terminalInitialized = true;
@@ -370,9 +430,9 @@ export class SessionController {
       if (!this.isCurrentTerminalMessage(message)) {
         return;
       }
-      const cols = Math.floor(message.cols ?? 0);
-      const rows = Math.floor(message.rows ?? 0);
-      if (cols <= 0 || rows <= 0 || cols > 1000 || rows > 1000) {
+      const cols = message.cols ?? 0;
+      const rows = message.rows ?? 0;
+      if (!Number.isSafeInteger(cols) || !Number.isSafeInteger(rows) || cols <= 0 || rows <= 0 || cols > 1000 || rows > 1000) {
         return;
       }
       const changed = cols !== this.terminalSize.cols || rows !== this.terminalSize.rows;
@@ -385,7 +445,7 @@ export class SessionController {
       return;
     }
     if (message.type === 'error') {
-      if (message.sessionId !== undefined && !this.isCurrentTerminalMessage(message)) {
+      if (!this.isCurrentTerminalMessage(message)) {
         return;
       }
       if (message.fatal === true) {
@@ -396,6 +456,15 @@ export class SessionController {
       return;
     }
     if (!this.isCurrentTerminalMessage(message)) {
+      return;
+    }
+    if (message.type === 'input' || message.type === 'paste') {
+      if (typeof message.eventId !== 'string' || !/^[a-zA-Z0-9:_-]{1,128}$/.test(message.eventId) ||
+        !Number.isSafeInteger(message.inputEpoch) || typeof message.data !== 'string' || message.data.length > 1400000 ||
+        (message.encoding !== undefined && message.encoding !== 'utf8' && message.encoding !== 'binary')) return;
+    }
+    if (message.type === 'searchResult') {
+      if (typeof message.matched === 'boolean') this.onToast(message.matched ? '已定位匹配内容' : '未找到匹配内容');
       return;
     }
     if (message.type === 'input') {
@@ -419,23 +488,30 @@ export class SessionController {
         seq: message.seq ?? -1,
         byteLength: message.byteLength ?? -1
       };
-      if (ack.seq >= 0 && ack.byteLength >= 0) {
+      if (Number.isSafeInteger(ack.seq) && Number.isSafeInteger(ack.byteLength) && ack.seq > 0 &&
+        ack.byteLength > 0 && ack.byteLength <= 32768) {
         native.acknowledgeOutput(ack);
       }
     } else if (message.type === 'copy') {
+      if (typeof message.data !== 'string' || message.data.length > 1400000) return;
       try {
         this.onCopy(ByteCodec.decodeText(message.data ?? ''));
       } catch (_error) {
         this.onToast('无法复制当前选择');
       }
     } else if (message.type === 'pasteRequest') {
-      this.onPasteRequest();
+      if (this.snapshot.inputEnabled) this.onPasteRequest();
     }
   }
 
   dispose(): void {
+    this.reconnect.stop();
     this.clearProbe();
     this.attemptActive = false;
+    this.snapshot.state = ConnectionState.CLOSED;
+    this.snapshot.inputEnabled = false;
+    this.snapshot.terminalReady = false;
+    this.backend.markWebNotReady();
     this.clearPendingInputs();
     this.input.invalidate();
     if (this.initialized) {
@@ -514,7 +590,7 @@ export class SessionController {
       return;
     }
     if (event.type === 'error') {
-      this.markFailed(event.message ?? '连接失败');
+      this.markFailed(event.message ?? '连接失败', event.code ?? 'protocol');
       return;
     }
     if (event.type === 'state') {
@@ -523,12 +599,14 @@ export class SessionController {
         return;
       }
       if (state === ConnectionState.CLOSED || state === ConnectionState.FAILED) {
+        this.reconnect.stop();
         this.attemptActive = false;
         this.clearProbe();
         this.clearPendingInputs();
         this.invalidateInput();
       }
       this.publish(state, event.message ?? state);
+      if (state === ConnectionState.OPEN) this.reconnect.stop();
       if (state === ConnectionState.OPEN && this.terminalSize.cols > 0 && this.terminalSize.rows > 0) {
         native.resize(this.sessionId, this.connectionEpoch, this.terminalSize.cols, this.terminalSize.rows);
       }
@@ -552,11 +630,14 @@ export class SessionController {
     ready.suspended = !this.foreground || !this.networkAvailable;
     ready.checking = this.checking;
     ready.pasting = this.pasteTransaction !== null;
+    ready.selecting = this.selecting;
+    ready.retrying = this.reconnect.pending();
     ready.inputEnabled = ready.state === ConnectionState.OPEN && !ready.suspended && !ready.checking &&
-      !this.inputResetPending && this.selected;
+      !this.inputResetPending && this.selected && !this.selecting;
     this.rendererRecovering = false;
     this.snapshot = ready;
     this.onSnapshot(ready);
+    this.updateReconnectAvailability();
   }
 
   private enqueueInput(message: TerminalMessage): void {
@@ -651,6 +732,7 @@ export class SessionController {
   }
 
   private failRenderer(message: string): void {
+    this.reconnect.stop();
     this.clearProbe();
     this.attemptActive = false;
     if (this.connectionEpoch > 0) {
@@ -666,12 +748,15 @@ export class SessionController {
     this.publish(ConnectionState.FAILED, message);
   }
 
-  private markFailed(message: string): void {
+  private markFailed(message: string, code: string = 'protocol'): void {
     this.clearProbe();
+    if (this.attemptActive && this.connectionEpoch > 0) native.closeSession(this.sessionId, this.connectionEpoch);
     this.attemptActive = false;
     this.clearPendingInputs();
     this.invalidateInput();
     this.publish(ConnectionState.FAILED, message);
+    this.reconnect.failed(code);
+    if (this.snapshot.retrying !== this.reconnect.pending()) this.publish(this.snapshot.state, this.snapshot.message);
   }
 
   private publish(state: ConnectionState, message: string): void {
@@ -682,10 +767,14 @@ export class SessionController {
     next.suspended = !this.foreground || !this.networkAvailable;
     next.checking = this.checking;
     next.pasting = this.pasteTransaction !== null;
+    next.selecting = this.selecting;
+    next.retrying = this.reconnect.pending();
     next.inputEnabled = state === ConnectionState.OPEN && next.terminalReady && !next.suspended && !next.checking &&
-      !this.inputResetPending && this.selected;
+      !this.inputResetPending && this.selected && !this.selecting;
     this.snapshot = next;
+    if (!next.inputEnabled) this.keyboard.cancelAll();
     this.onSnapshot(next);
+    this.updateReconnectAvailability();
   }
 
   private parseState(value: string): ConnectionState | null {

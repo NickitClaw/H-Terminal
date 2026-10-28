@@ -10,6 +10,14 @@ HT_AUTH_SERVER_PID=''
 HT_AUTH_PORT=${HT_AUTH_PORT:-22228}
 cleanup() {
   HT_RESULT=$?
+  if [[ "$HT_RESULT" != 0 ]]; then
+    "$HT_HDC" shell snapshot_display -f /data/local/tmp/hterminal-ui-failure.png >/dev/null 2>&1 || true
+    "$HT_HDC" file recv /data/local/tmp/hterminal-ui-failure.png "$HT_WORK/failure.png" >/dev/null 2>&1 || true
+    "$HT_HDC" shell rm -f /data/local/tmp/hterminal-ui-failure.png >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$HT_WORK/picker-files.json" ]]; then
+    HT_UI_WORK="$HT_WORK" HT_CLEAN_UI_FILES=1 python3 "$HT_ROOT/scripts/provision-ui-files.py" > "$HT_WORK/picker-cleanup.log" 2>&1 || HT_RESULT=1
+  fi
   if [[ -n "$HT_SERVER_PID" ]]; then kill "$HT_SERVER_PID" 2>/dev/null || true; wait "$HT_SERVER_PID" 2>/dev/null || true; fi
   if [[ -n "$HT_AUTH_SERVER_PID" ]]; then kill "$HT_AUTH_SERVER_PID" 2>/dev/null || true; wait "$HT_AUTH_SERVER_PID" 2>/dev/null || true; fi
   "$HT_HDC" shell rm -f /data/local/tmp/hterminal-ui-layout.json >/dev/null 2>&1 || true
@@ -17,8 +25,12 @@ cleanup() {
     mkdir -p "$HT_ROOT/.runtime/last-ui-failure"
     cp "$HT_WORK/"*.log "$HT_ROOT/.runtime/last-ui-failure/" 2>/dev/null || true
     cp "$HT_WORK/layout.json" "$HT_ROOT/.runtime/last-ui-failure/" 2>/dev/null || true
+    cp "$HT_WORK/save-layout.json" "$HT_ROOT/.runtime/last-ui-failure/" 2>/dev/null || true
+    cp "$HT_WORK/failure.png" "$HT_ROOT/.runtime/last-ui-failure/" 2>/dev/null || true
+    cp "$HT_WORK/picker-files.json" "$HT_ROOT/.runtime/last-ui-failure/" 2>/dev/null || true
   fi
   rm -rf "$HT_WORK"
+  exit "$HT_RESULT"
 }
 trap cleanup EXIT
 "$HT_DEVECO/tools/node/bin/node" "$HT_ROOT/terminal/tests/ui-fixture.cjs" "$HT_PORT" > "$HT_WORK/server.log" 2>&1 &
@@ -36,6 +48,9 @@ for HT_ATTEMPT in {1..50}; do
   sleep 0.1
 done
 rg -q '^READY$' "$HT_WORK/auth-server.log"
+if [[ ${HT_UI_SCENARIO:-} == credentials ]]; then
+  HT_UI_WORK="$HT_WORK" python3 "$HT_ROOT/scripts/provision-ui-files.py"
+fi
 "$HT_ROOT/scripts/sign-debug.sh" "$HT_ROOT/entry/build/default/outputs/default/entry-default-unsigned.hap"
 "$HT_HDC" install -r "$HT_ROOT/.runtime/signing/H-Terminal-signed.hap"
 "$HT_HDC" shell power-shell wakeup

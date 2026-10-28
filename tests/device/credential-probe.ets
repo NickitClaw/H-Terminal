@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import native from 'libentry.so';
+import native, { NativeConnectOptions, NativeInputRequest } from 'libentry.so';
 import { CredentialVault } from '../../storage/CredentialVault';
 import { HuksCredentialCipher } from '../../storage/HuksCredentialCipher';
 import { PreferencesStore } from '../../storage/PreferencesStore';
@@ -22,6 +22,23 @@ export async function verifyDeviceStorage(context: common.Context): Promise<void
   let plaintext = new Uint8Array(0);
   let phase = 'inspection';
   try {
+    const expectRejection = (operation: () => void): void => {
+      let rejected = false;
+      try { operation(); } catch (_error) { rejected = true; }
+      if (!rejected) throw new Error('invalid NAPI arguments accepted');
+    };
+    expectRejection((): void => { native.getSessionMetrics('probe-missing', Number.NaN); });
+    expectRejection((): void => { native.resize('probe-missing', 1, Number.NaN, 24); });
+    expectRejection((): void => { native.answerAuthentication('probe-missing', 1, 1, new Array<string>(17).fill('fixture')); });
+    const input: NativeInputRequest = { sessionId: 'probe-missing', connectionEpoch: 1,
+      inputEpoch: 1, eventId: 'probe', data: 'QR==' };
+    expectRejection((): void => { native.writeInput(input); });
+    input.data = 'QQ==';
+    const malformedPhase = JSON.parse(JSON.stringify(input).replace('"data":"QQ=="', '"data":"QQ==","pastePhase":0')) as NativeInputRequest;
+    expectRejection((): void => { native.writeInput(malformedPhase); });
+    const options: NativeConnectOptions = { sessionId: 'probe-missing', connectionEpoch: 1, terminalGeneration: 1,
+      filesDir: context.filesDir, host: '10.0.2.2', port: Number.NaN, username: 'review', password: '', cols: 80, rows: 24 };
+    expectRejection((): void => { native.connect(options); });
     const info = await native.inspectPrivateKey(key, '');
     const encryptedInfo = await native.inspectPrivateKey(encryptedKey, 'fixture-passphrase');
     if (!info.publicKey.startsWith('ssh-ed25519 ') || !encryptedInfo.fingerprint.startsWith('SHA256:')) {

@@ -36,3 +36,18 @@ body {
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
+
+#local-selection {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  color: #e5edf5;
+  background: #101820;
+  font-family: monospace;
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+  overscroll-behavior: contain;
+}

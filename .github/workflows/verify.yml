@@ -9,16 +9,58 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24.14.1'
           cache: npm
           cache-dependency-path: terminal/package-lock.json
       - run: ./scripts/verify.sh unit
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: unit-verification
+          path: .runtime/verification/
+          include-hidden-files: true
+          retention-days: 14
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: terminal/package-lock.json
+      - run: npm ci --prefix terminal --ignore-scripts --no-audit --no-fund
+      - run: npm --prefix terminal exec -- playwright-core install --with-deps chromium
+      - run: ./scripts/verify.sh browser
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: browser-verification
+          path: .runtime/verification/
+          include-hidden-files: true
+          retention-days: 14
   device:
     if: github.event_name == 'workflow_dispatch' && vars.HT_DEVICE_RUNNER == 'enabled'
     runs-on: [self-hosted, macOS, hterminal-api26]
+    timeout-minutes: 90
+    env:
+      HT_DOCKER_CONTEXT: ${{ vars.HT_DOCKER_CONTEXT || 'colima' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - run: ./scripts/verify.sh all
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: device-verification
+          path: .runtime/verification/
+          include-hidden-files: true
+          retention-days: 14

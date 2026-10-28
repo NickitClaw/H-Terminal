@@ -20,6 +20,11 @@ namespace hterminal {
 bool EnsureSshInitialized();
 bool SupportedPrivateKeyContainer(const std::string &key);
 struct TrustedHostKey { std::string publicKey; std::string fingerprint; };
+struct SessionMetrics {
+    uint64_t outputBytes = 0, inputBytes = 0, outputFrames = 0, acknowledgedFrames = 0;
+    uint64_t unackedBytes = 0, peakUnackedBytes = 0, peakInputBytes = 0, peakReceiveBytes = 0;
+    uint64_t queuedInputBytes = 0, elapsedMs = 0;
+};
 bool AccessTrustedHostKey(const std::string &filesDir, const std::string &host, uint32_t port,
                          const std::string &expectedFingerprint, bool remove, TrustedHostKey &result);
 
@@ -47,6 +52,7 @@ public:
     const std::string &Id() const;
     uint64_t Epoch() const;
     bool IsActive() const;
+    SessionMetrics Metrics() const;
 
 private:
     enum class PublicState {
@@ -123,6 +129,7 @@ private:
     void AdvanceVerifyHost();
     void AdvanceAuthenticate();
     void RequestAuthenticationAnswers();
+    void RequestLocalSecret(const char *prompt);
     void AdvanceOpenChannel();
     void AdvanceRequestPty();
     void AdvanceRequestShell();
@@ -149,8 +156,8 @@ private:
     void HandleRemoteClosed();
 
     bool SetState(PublicState state, const char *name);
-    void EmitError(const std::string &message);
-    void Fail(const std::string &message);
+    void EmitError(const std::string &message, const std::string &code = "protocol");
+    void Fail(const std::string &message, const std::string &code = "");
     bool IsOpenForInput() const;
 
     std::unique_ptr<NativeConnectOptions> options_;
@@ -188,6 +195,12 @@ private:
     std::atomic<uint64_t> challengeId_{0};
     std::atomic<bool> answerQueued_{false};
     size_t promptCount_ = 0;
+    bool localSecretPending_ = false;
+    bool localSecretAsked_ = false;
+    std::string failureKind_ = "protocol";
+    const std::chrono::steady_clock::time_point createdAt_ = std::chrono::steady_clock::now();
+    std::atomic<uint64_t> outputBytes_{0}, inputBytes_{0}, outputFrames_{0}, acknowledgedFrames_{0};
+    std::atomic<uint64_t> unackedBytes_{0}, peakUnackedBytes_{0}, peakInputBytes_{0}, peakReceiveBytes_{0};
     Stage stage_ = Stage::Connect;
     std::chrono::steady_clock::time_point deadline_{};
     bool handshakeDeadlineStarted_ = false;

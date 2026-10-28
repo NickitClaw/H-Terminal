@@ -11,6 +11,7 @@ export interface NativeConnectOptions {
   rows: number;
   authMethod?: string;
   privateKey?: string;
+  promptForSecret?: boolean;
 }
 
 export interface NativeInputRequest {
@@ -42,6 +43,7 @@ export interface NativeEvent {
   byteLength?: number;
   data?: string;
   message?: string;
+  code?: string;
   host?: string;
   port?: number;
   keyType?: string;
@@ -56,8 +58,21 @@ export interface NativeEvent {
 
 export interface NativeAuthPrompt { text: string; echo: boolean; }
 export interface NativeKeyInfo { publicKey: string; fingerprint: string; }
+export interface NativeSessionMetrics {
+  outputBytes: number;
+  inputBytes: number;
+  outputFrames: number;
+  acknowledgedFrames: number;
+  unackedBytes: number;
+  peakUnackedBytes: number;
+  peakInputBytes: number;
+  peakReceiveBytes: number;
+  queuedInputBytes: number;
+  elapsedMs: number;
+}
 
 export const initialize: (callback: (event: NativeEvent) => void) => void;
+export const getSessionMetrics: (sessionId: string, connectionEpoch: number) => NativeSessionMetrics;
 export const connect: (options: NativeConnectOptions) => void;
 export const trustDecision: (sessionId: string, connectionEpoch: number, accepted: boolean) => void;
 export const writeInput: (request: NativeInputRequest) => boolean;
