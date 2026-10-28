@@ -22,7 +22,7 @@ function fixture() {
   session.initialize('/isolated'); backend.markWebReady();
   assert.equal(session.connect('localhost', 22, 'review', 'review'), true);
   emit({ ...connection, type: 'state', state: 'OPEN' });
-  return { session, probes, writes, closes, get snapshot() { return snapshot; },
+  return { session, web, probes, writes, closes, get snapshot() { return snapshot; },
     respond(requestId) { emit({ ...connection, type: 'probe', requestId }); } };
 }
 
@@ -85,5 +85,42 @@ test('idle checks do not interrupt an in-progress paste', () => {
     assert.equal(f.snapshot.pasting, true);
     f.session.checkIdleConnection(Date.now() + 31000);
     assert.equal(f.probes.length, 0);
+  } finally { f.session.dispose(); }
+});
+
+test('IME preference resumes after selection and tab changes, without enabling a hidden terminal', () => {
+  const f = fixture();
+  try {
+    f.session.setImeMode(true);
+    assert.equal(f.web.textarea.readOnly, false);
+    f.session.setLocalSelection(true);
+    assert.equal(f.web.textarea.readOnly, true);
+    f.session.setLocalSelection(false);
+    assert.equal(f.web.textarea.readOnly, false, 'leaving selection must restore IME');
+    f.session.setSelected(false);
+    assert.equal(f.web.textarea.readOnly, true);
+    f.session.setImeMode(true);
+    assert.equal(f.web.textarea.readOnly, true, 'hidden sessions must remain read-only');
+    f.session.setSelected(true);
+    assert.equal(f.web.textarea.readOnly, false, 'returning to a tab must restore its IME');
+    f.session.setImeMode(false);
+    f.session.setSelected(false); f.session.setSelected(true);
+    assert.equal(f.web.textarea.readOnly, true, 'an explicit IME off choice must persist');
+  } finally { f.session.dispose(); }
+});
+
+test('IME resumes only after a current foreground/network probe, and resets on reconnect', () => {
+  const f = fixture();
+  try {
+    f.session.setImeMode(true);
+    for (const change of [value => f.session.setForeground(value), value => f.session.setNetworkAvailable(value)]) {
+      change(false); assert.equal(f.web.textarea.readOnly, true);
+      change(true); assert.equal(f.web.textarea.readOnly, true, 'probe must complete first');
+      f.respond(f.probes.at(-1)[2]); assert.equal(f.web.textarea.readOnly, false);
+    }
+    f.session.disconnect();
+    assert.equal(f.web.textarea.readOnly, true);
+    assert.equal(f.session.connect('localhost', 22, 'review', 'review'), true);
+    assert.equal(f.web.textarea.readOnly, true, 'a new connection starts with IME disabled');
   } finally { f.session.dispose(); }
 });

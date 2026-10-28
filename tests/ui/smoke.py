@@ -299,6 +299,20 @@ def credentials_flow():
               ' Ed25519 login, active deletion guard and cleanup', flush=True)
 
 
+def ime_text(text):
+    before = sum(line.startswith('INPUT ') for line in (WORK / 'server.log').read_text().splitlines())
+    call('shell', 'uitest', 'uiInput', 'text', text)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        records = [line for line in (WORK / 'server.log').read_text().splitlines() if line.startswith('INPUT ')][before:]
+        received = b''.join(base64.b64decode(line.split(' ', 2)[2]) for line in records)
+        if received:
+            assert received == text.encode(), received
+            return
+        time.sleep(.05)
+    raise AssertionError('IME text did not reach SSH after restoration')
+
+
 def main():
     wait(lambda e: find(e, '连接 SSH 服务器'))
     if os.environ.get('HT_UI_SCENARIO') == 'soak':
@@ -307,6 +321,26 @@ def main():
         return
     if os.environ.get('HT_UI_SCENARIO') == 'credentials':
         credentials_flow()
+        return
+    if os.environ.get('HT_UI_SCENARIO') == 'ime-lifecycle':
+        connect()
+        click(find(layout(), '中文', 'Button'))
+        wait(lambda e: find(e, '英文', 'Button'))
+        ime_text('ime-before')
+        call('shell', 'uitest', 'uiInput', 'keyEvent', 'Home')
+        time.sleep(.3)
+        call('shell', 'aa', 'start', '-a', 'EntryAbility', '-b', 'com.nickitclaw.hterminal')
+        wait(lambda e: find(e, 'OPEN') and find(e, '英文', 'Button') and not find(e, '检查连接'))
+        time.sleep(.3)
+        ime_text('ime-foreground')
+        click(by_id(layout(), 'new-session'))
+        wait(lambda e: by_id(e, 'tab-session-2'))
+        click(by_id(layout(), 'tab-session-1'))
+        wait(lambda e: find(e, 'OPEN') and find(e, '英文', 'Button'))
+        ime_text('ime-tab')
+        click(find(layout(), '英文', 'Button'))
+        press('Q', 'q', b'q')
+        print('PASS: actual ArkWeb IME input survives foreground and tab restoration; explicit IME off restores soft keys', flush=True)
         return
     if os.environ.get('HT_UI_SCENARIO') == 'reconnect':
         connect(automatic=True)

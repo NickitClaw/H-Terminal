@@ -53,3 +53,16 @@ test('real controllers do not retry authentication/host trust failures or user d
     f.session.disconnect(); t.mock.timers.tick(100000); assert.equal(f.calls.connect.length, 1);
   } finally { f.session.dispose(); }
 });
+
+test('stopping while an asynchronous retry is preparing clears the retry indicator', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] }); const f = fixture();
+  try {
+    f.session.onReconnectRequested = () => {}; // A vault read is still pending.
+    f.session.setAutoReconnect(true);
+    f.emit({ ...f.calls.connect[0], type: 'error', code: 'network' });
+    t.mock.timers.tick(1200);
+    f.session.cancelReconnect();
+    assert.equal(f.session.getSnapshot().retrying, false);
+    assert.equal(f.calls.connect.length, 1);
+  } finally { f.session.dispose(); }
+});

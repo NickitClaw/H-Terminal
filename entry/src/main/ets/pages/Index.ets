@@ -365,7 +365,7 @@ struct Index {
     if (this.snapshot.state === ConnectionState.OPEN) {
       if (this.tabs.length >= 4) { this.showToast('请先关闭一个标签'); return; }
       this.newTab();
-    }
+    } else this.cancelConnectionForm();
     this.hostId = profile.id;
     this.hostName = profile.name;
     this.host = profile.host;
@@ -394,7 +394,10 @@ struct Index {
   }
 
   private async connect(automatic: boolean = false, confirmed: boolean = false): Promise<void> {
-    if (this.forgettingTrust) return;
+    if (this.forgettingTrust) {
+      if (automatic) this.session.cancelReconnect();
+      return;
+    }
     if (!automatic) {
       this.session.cancelReconnect();
       if (!confirmed && this.session.getConnectionEpoch() > 0) {
@@ -412,10 +415,11 @@ struct Index {
     const request = ++this.connectRequest;
     const session = this.session;
     const epoch = session.getConnectionEpoch();
+    const profile = this.currentProfile();
     const host = this.host, username = this.username, password = this.password, method = this.authMethod;
     this.preparingConnection = true;
     const tab = this.workspace?.active();
-    if (tab) { tab.profile = this.currentProfile(); tab.identity = new HostKeyInfo(); }
+    if (tab) { tab.profile = profile; tab.identity = new HostKeyInfo(); }
     this.identity = new HostKeyInfo();
     let bytes = new Uint8Array(0);
     try {
@@ -424,29 +428,47 @@ struct Index {
         bytes = await this.vault.read(this.credentialId);
       }
       if (request !== this.connectRequest || session.getConnectionEpoch() !== epoch) return;
-      session.setAutoReconnect(this.autoReconnect);
+      if (JSON.stringify(this.currentProfile()) !== JSON.stringify(profile) || this.password !== password) {
+        session.cancelReconnect();
+        this.showToast('连接配置已变化，请重新连接');
+        return;
+      }
+      session.setAutoReconnect(profile.autoReconnect);
       const started = session.connect(host, port, username, password, method,
         bytes.length > 0 ? ByteCodec.decodeText(ByteCodec.encodeBytes(bytes)) : '', automatic);
       if (started) {
         this.imeMode = false;
         this.cancelPasteRequest();
       }
-    } catch (_error) { session.cancelReconnect(); this.showToast('凭据无法解锁，请检查密钥和设备状态'); }
+    } catch (_error) {
+      if (request === this.connectRequest && session.getConnectionEpoch() === epoch) {
+        session.cancelReconnect();
+        this.showToast('凭据无法解锁，请检查密钥和设备状态');
+      }
+    }
     finally {
       bytes.fill(0);
-      if (request === this.connectRequest) { this.preparingConnection = false; this.password = ''; }
+      if (request === this.connectRequest) {
+        if (automatic && session.getConnectionEpoch() === epoch) session.cancelReconnect();
+        this.preparingConnection = false;
+        if (this.password === password) this.password = '';
+      }
     }
   }
 
   private cancelConnectionForm(): void {
-    ++this.connectRequest;
-    this.preparingConnection = false;
-    this.password = '';
-    this.session.cancelReconnect();
+    this.stopReconnect();
     if ([ConnectionState.CONNECTING, ConnectionState.VERIFYING_HOST, ConnectionState.AUTHENTICATING].includes(this.snapshot.state)) {
       this.session.disconnect();
     }
     this.showConnect = false;
+  }
+
+  private stopReconnect(): void {
+    ++this.connectRequest;
+    this.preparingConnection = false;
+    this.password = '';
+    this.session.cancelReconnect();
   }
 
   private async importKey(): Promise<void> {
@@ -701,7 +723,7 @@ struct Index {
       })
       if (this.snapshot.retrying) {
         Button('停止重连').id('stop-reconnect').fontSize(11).height(28)
-          .onClick((): void => { this.session.cancelReconnect(); })
+          .onClick((): void => { this.stopReconnect(); })
       }
       if (this.identity.fingerprint.length > 0) {
         Button('指纹').fontSize(11).height(28).onClick((): void => {

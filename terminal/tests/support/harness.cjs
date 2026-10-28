@@ -40,6 +40,7 @@ function createTerminalHarness(onMessage = () => {}) {
   const messages = [];
   const writes = [];
   let terminal;
+  let textarea;
   class FakeTerminal {
     constructor(options) {
       this.options = options;
@@ -59,7 +60,7 @@ function createTerminalHarness(onMessage = () => {}) {
   const host = {
     clientWidth: 800, clientHeight: 600, addEventListener() {},
     style: {},
-    querySelector: () => ({ blur() {}, setAttribute() {} })
+    querySelector: () => (textarea = { readOnly: true, blur() {}, setAttribute() {} })
   };
   const selectionHost = { style: {}, textContent: '', hidden: true };
   const searches = [];
@@ -90,7 +91,8 @@ function createTerminalHarness(onMessage = () => {}) {
     receive: (message) => window.HTerminal.receive(JSON.stringify(message)),
     setInbox: (take) => { window.HTerminalBridge.takeMessage = take; },
     drain: () => window.HTerminal.drain(),
-    get terminal() { return terminal; }
+    get terminal() { return terminal; },
+    get textarea() { return textarea; }
   };
 }
 

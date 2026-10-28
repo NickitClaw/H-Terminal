@@ -55,6 +55,7 @@ export class SessionController {
   private inputResetPending: boolean = false;
   private selected: boolean = true;
   private selecting: boolean = false;
+  private imeMode: boolean = false;
   private connectedHost: string = '';
   private connectedPort: number = 0;
   private lastActivity: number = Date.now();
@@ -79,7 +80,7 @@ export class SessionController {
     if (this.snapshot.retrying !== this.reconnect.pending()) this.publish(this.snapshot.state, this.snapshot.message);
   }
   cancelReconnect(): void {
-    const pending = this.reconnect.pending();
+    const pending = this.reconnect.pending() || this.snapshot.retrying;
     this.reconnect.stop();
     if (pending) this.publish(this.snapshot.state, '已停止自动重连，请手动连接');
   }
@@ -162,6 +163,7 @@ export class SessionController {
     const initialRows = this.terminalSize.rows;
     this.clearPendingInputs();
     this.selecting = false;
+    this.imeMode = false;
     this.connectionEpoch++;
     this.input.beginSession(this.sessionId, this.connectionEpoch);
     // A new identity may wait for the previous xterm.write callback before
@@ -282,9 +284,10 @@ export class SessionController {
   }
 
   setImeMode(enabled: boolean): void {
+    this.imeMode = enabled;
     if (this.pasteTransaction !== null) this.stopPaste(false);
     else this.invalidateInput();
-    this.backend.focus(enabled);
+    this.backend.focus(enabled && this.snapshot.inputEnabled);
   }
 
   setLocalSelection(enabled: boolean): void {
@@ -623,6 +626,7 @@ export class SessionController {
       this.terminalSize.cols <= 0 || this.terminalSize.rows <= 0) {
       return;
     }
+    const previouslyEnabled = this.snapshot.inputEnabled;
     const ready = new SessionSnapshot();
     ready.state = this.snapshot.state;
     ready.message = this.rendererRecovering ? '终端已重新加载，请连接' : this.snapshot.message;
@@ -637,6 +641,7 @@ export class SessionController {
     this.rendererRecovering = false;
     this.snapshot = ready;
     this.onSnapshot(ready);
+    this.restoreImeFocus(previouslyEnabled);
     this.updateReconnectAvailability();
   }
 
@@ -760,6 +765,7 @@ export class SessionController {
   }
 
   private publish(state: ConnectionState, message: string): void {
+    const previouslyEnabled = this.snapshot.inputEnabled;
     const next = new SessionSnapshot();
     next.state = state;
     next.message = message;
@@ -774,7 +780,12 @@ export class SessionController {
     this.snapshot = next;
     if (!next.inputEnabled) this.keyboard.cancelAll();
     this.onSnapshot(next);
+    this.restoreImeFocus(previouslyEnabled);
     this.updateReconnectAvailability();
+  }
+
+  private restoreImeFocus(previouslyEnabled: boolean): void {
+    if (this.imeMode && previouslyEnabled !== this.snapshot.inputEnabled) this.backend.focus(this.snapshot.inputEnabled);
   }
 
   private parseState(value: string): ConnectionState | null {

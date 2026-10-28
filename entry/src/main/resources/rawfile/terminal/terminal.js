@@ -469,14 +469,26 @@
       // when the remote TUI enabled mouse reporting. No remote HTML is used.
       const lines = [];
       let chars = 0;
+      let continuation = false;
       const buffer = term.buffer.active;
       for (let i = buffer.length - 1; i >= 0; i--) {
-        const line = buffer.getLine(i).translateToString(true);
-        if (chars + line.length + 1 > 256 * 1024) break;
-        chars += line.length + 1;
-        lines.push(line);
+        const line = buffer.getLine(i);
+        let end = term.cols;
+        // A wide character may wrap before the last column. Its empty
+        // padding cell is not a space in the logical line.
+        if (continuation && i + 1 < buffer.length) {
+          const last = line.getCell(end - 1);
+          const first = buffer.getLine(i + 1).getCell(0);
+          if (last && first && last.getWidth() === 1 && last.getChars() === '' && first.getWidth() === 2) end--;
+        }
+        const text = line.translateToString(!continuation, 0, end);
+        const separator = lines.length > 0 && !continuation ? '\n' : '';
+        if (chars + text.length + separator.length > 256 * 1024) break;
+        chars += text.length + separator.length;
+        lines.push(text + separator);
+        continuation = line.isWrapped;
       }
-      selectionHost.textContent = lines.reverse().join("\n");
+      selectionHost.textContent = lines.reverse().join('');
       selectionHost.style.fontSize = `${term.options.fontSize}px`;
       configureTextarea(false, false);
     } else {

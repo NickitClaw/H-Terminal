@@ -49,3 +49,20 @@ test('font preferences accept valid old/new documents and reject malformed sizes
     await repo.load(); assert.equal(repo.preferences().fontSize, expected);
   }
 });
+
+test('selection preserves logical lines and spaces across soft wrapping', () => {
+  const f = fixture();
+  const rows = [
+    { text: 'abcdefgh  ', isWrapped: false },
+    { text: 'ij', isWrapped: true },
+    { text: 'hard-next', isWrapped: false }
+  ];
+  f.terminal.cols = 10;
+  f.terminal.buffer.active = { length: rows.length, getLine: index => ({
+    isWrapped: rows[index].isWrapped,
+    translateToString: trim => trim ? rows[index].text.trimEnd() : rows[index].text,
+    getCell: () => ({ getChars: () => ' ', getWidth: () => 1 })
+  }) };
+  f.receive({ type: 'selection', ...identity, selecting: true });
+  assert.equal(f.selectionHost.textContent, 'abcdefgh  ij\nhard-next');
+});

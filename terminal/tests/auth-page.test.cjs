@@ -2,13 +2,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { loadPageMethods, ByteCodec } = require('./support/harness.cjs');
 const flush = () => new Promise(resolve => setImmediate(resolve));
-const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const deferred = () => { let resolve, reject; const promise = new Promise((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; };
 
 function fixture() {
   const picked = deferred(), inspected = deferred(), saved = deferred(), reads = deferred();
-  const calls = { saves: [], connects: [], dialogs: [], removed: [], toasts: [], buffers: [] };
-  const Page = loadPageMethods(['importKey', 'connect', 'clearAuthentication', 'submitAuthentication', 'deleteCredential', 'cancelConnectionForm', 'closeTab', 'credentialInUse'], {
+  const calls = { saves: [], connects: [], dialogs: [], removed: [], toasts: [], buffers: [], canceled: 0 };
+  const Page = loadPageMethods(['importKey', 'connect', 'clearAuthentication', 'submitAuthentication', 'deleteCredential', 'cancelConnectionForm', 'closeTab', 'credentialInUse', 'useHost', 'currentProfile', 'stopReconnect'], {
     ByteCodec, ConnectionState: { CONNECTING: 'CONNECTING', VERIFYING_HOST: 'VERIFYING_HOST', AUTHENTICATING: 'AUTHENTICATING', OPEN: 'OPEN' },
+    HostProfile: class {},
     native: { inspectPrivateKey: () => inspected.promise },
     picker: { DocumentViewPicker: class { select() { return picked.promise; } } },
     fileIo: { OpenMode: { READ_ONLY: 0 }, openSync: () => ({ fd: 1 }), statSync: () => ({ size: 8 }),
@@ -18,10 +19,10 @@ function fixture() {
   const page = Object.assign(new Page(), { pageActive: true, pageGeneration: 1, activeTabId: 'one', hostName: 'first',
     importingKey: false, password: 'original-passphrase', credentialId: '', host: 'host.test', portText: '22', username: 'review',
     authMethod: 'publickey', connectRequest: 0, hosts: [], tabs: [], preparingConnection: false,
-    authAnswers: [], authTarget: null, authChallenge: null });
+    authAnswers: [], authTarget: null, authChallenge: null, snapshot: { state: 'IDLE' } });
   page.vault = { async save(...args) { calls.saves.push(args); return saved.promise; }, list: () => [{ id: 'saved' }],
     read: () => reads.promise, async remove(id) { calls.removed.push(id); } };
-  page.session = { getConnectionEpoch: () => 0, cancelReconnect() {}, setAutoReconnect() {},
+  page.session = { getConnectionEpoch: () => 0, cancelReconnect() { calls.canceled++; }, setAutoReconnect() {},
     connect: (...args) => { calls.connects.push(args); return true; } };
   page.getUIContext = () => ({ getHostContext: () => ({}) });
   page.showToast = text => calls.toasts.push(text);
@@ -107,4 +108,53 @@ test('a deletion confirmation rechecks references acquired while the dialog was 
   f.page.deleteCredential(credential); assert.equal(f.calls.dialogs.length, 1);
   f.page.tabs = [{ profile: { credentialId: 'key' }, snapshot: { state: 'FAILED', retrying: true } }];
   f.calls.dialogs[0].secondaryButton.action(); await flush(); assert.deepEqual(f.calls.removed, []);
+});
+
+test('loading another saved host cancels an outstanding private key unlock', async () => {
+  const f = fixture(); f.page.credentialId = 'first-key';
+  const pending = f.page.connect();
+  f.page.useHost({ id: 'other', name: 'other', host: 'other.test', port: 2222,
+    username: 'other-user', authMethod: 'password', credentialId: '', autoReconnect: false });
+  const bytes = new Uint8Array([1, 2, 3]); f.reads.resolve(bytes); await pending;
+  assert.equal(f.calls.connects.length, 0, 'old unlock must not connect after loading a different host');
+  assert.equal(f.page.host, 'other.test'); assert.equal(f.page.preparingConnection, false);
+  assert.deepEqual([...bytes], [0, 0, 0]);
+});
+
+test('editing the form during unlock rejects the old intent and preserves the new secret', async () => {
+  const f = fixture(); f.page.credentialId = 'first-key';
+  const pending = f.page.connect();
+  f.page.host = 'edited.test'; f.page.password = 'new-form-secret';
+  const bytes = new Uint8Array([1, 2, 3]); f.reads.resolve(bytes); await pending;
+  assert.equal(f.calls.connects.length, 0, 'old parameters must not be used after editing');
+  assert.equal(f.page.password, 'new-form-secret'); assert.equal(f.page.preparingConnection, false);
+  assert.deepEqual([...bytes], [0, 0, 0]);
+});
+
+test('stopping reconnect also cancels an in-flight private key unlock', async () => {
+  const f = fixture(); f.page.credentialId = 'key';
+  const pending = f.page.connect(true);
+  assert.equal(f.page.preparingConnection, true);
+  f.page.stopReconnect();
+  assert.equal(f.page.preparingConnection, false);
+  const bytes = new Uint8Array([1, 2, 3]); f.reads.resolve(bytes); await pending;
+  assert.equal(f.calls.connects.length, 0);
+  assert.deepEqual([...bytes], [0, 0, 0]);
+});
+
+test('a canceled unlock failure cannot cancel a newer retry or clear its new secret', async () => {
+  const f = fixture(); f.page.credentialId = 'key';
+  const pending = f.page.connect(true); f.page.stopReconnect();
+  f.page.password = 'new-secret';
+  f.reads.reject(new Error('late unlock failure')); await pending;
+  assert.equal(f.calls.canceled, 1);
+  assert.equal(f.calls.toasts.length, 0);
+  assert.equal(f.page.password, 'new-secret');
+});
+
+test('an automatic retry without an available credential leaves no retry in progress', async () => {
+  const f = fixture(); await f.page.connect(true);
+  assert.equal(f.calls.connects.length, 0);
+  assert.equal(f.calls.canceled, 1);
+  assert.equal(f.page.preparingConnection, false);
 });

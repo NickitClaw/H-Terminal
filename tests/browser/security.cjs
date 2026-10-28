@@ -61,10 +61,18 @@ fs.mkdirSync(report, { recursive: true });
     assert.equal(await page.evaluate(() => window.__remoteExecuted), undefined);
     assert.equal(await receive({ type: 'key', inputEpoch: 1, eventId: 'blocked', key: 'Enter' }), false);
     assert.equal(await receive({ type: 'selection', selecting: false }), true);
+    await page.evaluate(() => { window.__fixtureTerminal.reset(); window.__fixtureTerminal.resize(10, 8); });
+    const wrapped = Buffer.from('abcdefgh  ij\r\n123456789界Z\r\nhard-next');
+    assert.equal(await receive({ type: 'output', seq: 2, byteLength: wrapped.length, data: wrapped.toString('base64') }), true);
+    for (let i = 0; i < 100 && !messages.some(m => m.type === 'ack' && m.seq === 2); i++) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.ok(messages.some(m => m.type === 'ack' && m.seq === 2));
+    assert.equal(await receive({ type: 'selection', selecting: true }), true);
+    assert.equal((await page.locator('#local-selection').textContent()).trimEnd(), 'abcdefgh  ij\n123456789界Z\nhard-next');
+    assert.equal(await receive({ type: 'selection', selecting: false }), true);
     assert.deepEqual(requests, []); assert.deepEqual(errors, []);
     await page.screenshot({ path: path.join(report, 'hostile-output.png') });
     fs.writeFileSync(path.join(report, 'result.json'), JSON.stringify({ passed: true, browser: browser.version(),
-      assertions: ['hostile text/OSC/title/link', 'OSC52 denied', 'offline requests', 'malformed envelopes', 'literal search', 'plain read-only snapshot'] }, null, 2));
+      assertions: ['hostile text/OSC/title/link', 'OSC52 denied', 'offline requests', 'malformed envelopes', 'literal search', 'plain read-only snapshot', 'soft wraps, spaces and wide characters preserved'] }, null, 2));
     console.log('PASS: shipped xterm page rejects malicious OSC/navigation/clipboard and malformed messages; no network requests or script execution');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
