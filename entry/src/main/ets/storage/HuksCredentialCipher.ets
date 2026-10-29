@@ -22,8 +22,8 @@ export class HuksCredentialCipher implements CredentialCipher {
         value: huks.HuksKeyPurpose.HUKS_KEY_PURPOSE_ENCRYPT | huks.HuksKeyPurpose.HUKS_KEY_PURPOSE_DECRYPT }
     ];
     await huks.generateKeyItem(this.alias(id), { properties: properties });
-    const nonce = cryptoFramework.createRandom().generateRandomSync(12).data;
     try {
+      const nonce = cryptoFramework.createRandom().generateRandomSync(12).data;
       const cipher = await this.operate(id, plaintext, nonce, aad, true);
       const sealed = new SealedData();
       sealed.nonce = ByteCodec.encodeBytes(nonce); sealed.ciphertext = ByteCodec.encodeBytes(cipher);

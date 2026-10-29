@@ -24,4 +24,9 @@ export class ByteCodec {
   static byteLength(text: string): number {
     return ByteCodec.encoder.encodeInto(text).length;
   }
+
+  static validateUtf8(bytes: Uint8Array): void {
+    if (bytes.length === 0) return;
+    util.TextDecoder.create('utf-8', { fatal: true }).decodeToString(bytes);
+  }
 }

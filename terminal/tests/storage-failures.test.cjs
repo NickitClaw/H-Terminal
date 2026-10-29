@@ -101,3 +101,24 @@ test('deleting an already missing HUKS alias succeeds while other HUKS errors re
   failure = null; await cipher.remove('present');
   assert.ok(deleted.every(alias => alias.startsWith('hterminal-import-')));
 });
+
+test('a nonce generation failure releases the HUKS alias created for the failed save', async () => {
+  for (const phase of ['createRandom', 'generateRandomSync']) {
+    const aliases = new Set(); let created = 0;
+    const load = createEtsLoader({ kits: {
+      '@kit.UniversalKeystoreKit': { huks: {
+        HuksTag: { HUKS_TAG_ALGORITHM: 1, HUKS_TAG_KEY_SIZE: 2, HUKS_TAG_PURPOSE: 3 },
+        HuksKeyAlg: { HUKS_ALG_AES: 1 }, HuksKeyPurpose: { HUKS_KEY_PURPOSE_ENCRYPT: 1, HUKS_KEY_PURPOSE_DECRYPT: 2 },
+        async generateKeyItem(alias) { aliases.add(alias); created++; },
+        async deleteKeyItem(alias) { aliases.delete(alias); }
+      } },
+      '@kit.CryptoArchitectureKit': { cryptoFramework: { createRandom() {
+        if (phase === 'createRandom') throw new Error('RNG unavailable');
+        return { generateRandomSync() { throw new Error('RNG unavailable'); } };
+      } } }
+    } });
+    const { HuksCredentialCipher } = load('entry/src/main/ets/storage/HuksCredentialCipher.ets');
+    await assert.rejects(new HuksCredentialCipher().seal('draft', new Uint8Array([1]), 'fixture'));
+    assert.equal(created, 1); assert.equal(aliases.size, 0, phase);
+  }
+});

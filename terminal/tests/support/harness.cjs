@@ -9,7 +9,8 @@ const ByteCodec = {
   encodeBytes: (bytes) => Buffer.from(bytes).toString('base64'),
   decodeBytes: (text) => new Uint8Array(Buffer.from(text, 'base64')),
   decodeText: (text) => Buffer.from(text, 'base64').toString(),
-  byteLength: (text) => Buffer.byteLength(text)
+  byteLength: (text) => Buffer.byteLength(text),
+  validateUtf8: bytes => { new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
 };
 
 function createEtsLoader({ native = {}, display = {}, kits = {} } = {}) {

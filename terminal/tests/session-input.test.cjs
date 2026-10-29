@@ -109,3 +109,27 @@ test('clipboard LF and CRLF become single terminal returns with and without brac
     } finally { f.session.dispose(); }
   }
 });
+
+test('malformed UTF-8 paste messages cannot create an empty data chunk or jam later input', () => {
+  for (const bytes of [Buffer.alloc(5000, 0x80), Buffer.from([0xc0, 0xaf]), Buffer.from([0xed, 0xa0, 0x80]),
+    Buffer.from([0xf4, 0x90, 0x80, 0x80]), Buffer.from([0xe2, 0x82])]) {
+    const f = fixture();
+    try {
+      f.session.handleTerminalMessage(JSON.stringify({ type: 'paste', sessionId: f.session.getSessionId(),
+        connectionEpoch: f.session.getConnectionEpoch(), terminalGeneration: 1, inputEpoch: f.session.input.getInputEpoch(),
+        eventId: 'invalid-utf8', bracketed: true, data: bytes.toString('base64') }));
+      assert.equal(f.snapshot.pasting, false); assert.equal(f.writes.length, 0);
+      f.session.routeKey({ kind: 'key', id: 'Enter' });
+      assert.equal(Buffer.from(f.writes[0].data, 'base64').toString(), '\r');
+    } finally { f.session.dispose(); }
+  }
+});
+
+test('UTF-8 paste validation preserves BOM, NUL and multibyte characters byte for byte', async () => {
+  const f = fixture(true);
+  try {
+    const text = '\uFEFFzero\0界🙂'; f.paste(text); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.snapshot.pasting, false);
+    assert.equal(Buffer.concat(f.writes.map(value => Buffer.from(value.data, 'base64'))).toString(), '\x1b[200~' + text + '\x1b[201~');
+  } finally { f.session.dispose(); }
+});

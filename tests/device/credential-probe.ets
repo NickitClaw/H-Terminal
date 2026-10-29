@@ -25,8 +25,16 @@ export async function verifyDeviceStorage(context: common.Context): Promise<void
     const expectRejection = (operation: () => void): void => {
       let rejected = false;
       try { operation(); } catch (_error) { rejected = true; }
-      if (!rejected) throw new Error('invalid NAPI arguments accepted');
+      if (!rejected) throw new Error('invalid input accepted');
     };
+    phase = 'UTF-8 paste validation';
+    ByteCodec.validateUtf8(new Uint8Array(0));
+    ByteCodec.validateUtf8(ByteCodec.decodeBytes(ByteCodec.encodeText('\uFEFFzero\0界🙂')));
+    for (const invalid of [new Uint8Array(5000).fill(0x80), new Uint8Array([0xc0, 0xaf]),
+      new Uint8Array([0xed, 0xa0, 0x80]), new Uint8Array([0xf4, 0x90, 0x80, 0x80]), new Uint8Array([0xe2, 0x82])]) {
+      expectRejection((): void => { ByteCodec.validateUtf8(invalid); });
+    }
+    phase = 'inspection';
     expectRejection((): void => { native.getSessionMetrics('probe-missing', Number.NaN); });
     expectRejection((): void => { native.resize('probe-missing', 1, Number.NaN, 24); });
     expectRejection((): void => { native.answerAuthentication('probe-missing', 1, 1, new Array<string>(17).fill('fixture')); });

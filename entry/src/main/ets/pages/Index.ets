@@ -212,7 +212,12 @@ struct Index {
     this.showTerminalTools = false;
     this.searchText = '';
     const active = this.workspace?.active();
-    if (active) { active.profile = this.currentProfile(); active.imeMode = this.imeMode; active.symbols = this.symbolLayer; }
+    if (active) {
+      const profile = this.currentProfile();
+      if (active.snapshot.retrying && (this.preparingConnection || this.password.length > 0 ||
+        JSON.stringify(profile) !== JSON.stringify(active.profile))) active.session.cancelReconnect();
+      active.profile = profile; active.imeMode = this.imeMode; active.symbols = this.symbolLayer;
+    }
     ++this.connectRequest;
     this.preparingConnection = false;
     this.password = '';

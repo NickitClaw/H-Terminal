@@ -16,6 +16,7 @@ export class PasteTransaction {
 
   constructor(sessionId: string, connectionEpoch: number, inputEpoch: number, id: string,
     bytes: Uint8Array, bracketed: boolean) {
+    ByteCodec.validateUtf8(bytes);
     this.sessionId = sessionId;
     this.connectionEpoch = connectionEpoch;
     this.inputEpoch = inputEpoch;

@@ -1,13 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { loadPageMethods, ByteCodec } = require('./support/harness.cjs');
+const { loadPageMethods, ByteCodec, createEtsLoader } = require('./support/harness.cjs');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve, reject; const promise = new Promise((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; };
 
 function fixture() {
   const picked = deferred(), inspected = deferred(), saved = deferred(), reads = deferred();
   const calls = { saves: [], connects: [], dialogs: [], removed: [], toasts: [], buffers: [], canceled: 0 };
-  const Page = loadPageMethods(['importKey', 'connect', 'clearAuthentication', 'submitAuthentication', 'deleteCredential', 'cancelConnectionForm', 'closeTab', 'credentialInUse', 'useHost', 'currentProfile', 'stopReconnect', 'attachTab', 'applyProfile'], {
+  const Page = loadPageMethods(['importKey', 'connect', 'clearAuthentication', 'submitAuthentication', 'deleteCredential', 'cancelConnectionForm', 'closeTab', 'credentialInUse', 'useHost', 'currentProfile', 'stopReconnect', 'attachTab', 'applyProfile', 'leaveTab'], {
     ByteCodec, ConnectionState: { CONNECTING: 'CONNECTING', VERIFYING_HOST: 'VERIFYING_HOST', AUTHENTICATING: 'AUTHENTICATING', OPEN: 'OPEN' },
     HostProfile: class {},
     native: { inspectPrivateKey: () => inspected.promise },
@@ -162,9 +162,10 @@ test('an automatic retry without an available credential leaves no retry in prog
 function attachRetry(f) {
   f.page.password = ''; f.page.authMethod = 'password'; f.page.autoReconnect = true;
   f.page.session.input = {};
-  const tab = { id: 'one', session: f.page.session, backend: { setFontSize() {} }, profile: f.page.currentProfile() };
+  const tab = { id: 'one', session: f.page.session, backend: { setFontSize() {} }, profile: f.page.currentProfile(), snapshot: { retrying: true } };
   f.page.workspace = { active: () => tab };
   f.page.attachTab(tab);
+  return tab;
 }
 
 test('a retry deadline cannot overwrite edited host fields or erase a newly entered secret', async () => {
@@ -182,4 +183,52 @@ test('a retry with unchanged form fields still starts normally with a fresh auth
   assert.equal(f.calls.connects.length, 1);
   assert.equal(f.calls.connects[0][0], 'host.test'); assert.equal(f.calls.connects[0][3], '');
   assert.equal(f.calls.connects[0].at(-1), true);
+});
+
+function scheduledRetry(f) {
+  const tab = attachRetry(f);
+  const { ReconnectPolicy } = createEtsLoader()('entry/src/main/ets/lifecycle/ReconnectPolicy.ets');
+  const policy = new ReconnectPolicy(() => .5);
+  f.page.session.cancelReconnect = () => { f.calls.canceled++; policy.stop(); tab.snapshot.retrying = false; };
+  f.page.session.setAutoReconnect = enabled => policy.configure(enabled);
+  policy.configure(true); policy.onRetry = () => f.page.session.onReconnectRequested(); policy.failed('network');
+  return { tab, policy };
+}
+
+test('leaving an edited retry form cannot turn its draft into an automatically approved target', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const draft of [{ host: 'edited.test', password: '' }, { host: 'host.test', password: 'new-secret' }]) {
+    const f = fixture(), { tab, policy } = scheduledRetry(f);
+    try {
+      Object.assign(f.page, draft); f.page.leaveTab();
+      policy.setAvailable(false); t.mock.timers.tick(10000);
+      f.page.applyProfile(tab.profile); policy.setAvailable(true); t.mock.timers.tick(1200); await flush();
+      assert.equal(f.calls.connects.length, 0);
+      assert.equal(f.calls.canceled, 1); assert.equal(tab.profile.host, draft.host);
+      assert.equal(f.page.password, '');
+    } finally { policy.stop(); }
+  }
+});
+
+test('an unchanged retry pauses while hidden and resumes the original target when selected again', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(), { tab, policy } = scheduledRetry(f);
+  try {
+    f.page.leaveTab(); policy.setAvailable(false); t.mock.timers.tick(10000);
+    assert.equal(f.calls.connects.length, 0); assert.equal(f.calls.canceled, 0);
+    f.page.applyProfile(tab.profile); policy.setAvailable(true); t.mock.timers.tick(1200); await flush();
+    assert.equal(f.calls.connects.length, 1); assert.equal(f.calls.connects[0][0], 'host.test');
+  } finally { policy.stop(); }
+});
+
+test('leaving while an automatic unlock is pending clears retry state and rejects its late result', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(), { tab, policy } = scheduledRetry(f);
+  try {
+    f.page.authMethod = 'publickey'; f.page.credentialId = 'key'; tab.profile = f.page.currentProfile();
+    t.mock.timers.tick(1200); assert.equal(f.page.preparingConnection, true);
+    f.page.leaveTab(); assert.equal(tab.snapshot.retrying, false);
+    const bytes = new Uint8Array([1, 2, 3]); f.reads.resolve(bytes); await flush();
+    assert.equal(f.calls.connects.length, 0); assert.deepEqual([...bytes], [0, 0, 0]);
+  } finally { policy.stop(); }
 });
