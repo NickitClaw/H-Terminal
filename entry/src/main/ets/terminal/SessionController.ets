@@ -285,8 +285,9 @@ export class SessionController {
 
   setImeMode(enabled: boolean): void {
     this.imeMode = enabled;
-    if (this.pasteTransaction !== null) this.stopPaste(false);
-    else this.invalidateInput();
+    // Every input epoch change must reach Native, including when an earlier
+    // reset is still completing. Otherwise its acknowledgement becomes stale.
+    this.stopPaste(false);
     this.backend.focus(enabled && this.snapshot.inputEnabled);
   }
 

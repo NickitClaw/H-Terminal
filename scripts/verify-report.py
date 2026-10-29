@@ -150,7 +150,7 @@ def plan(mode):
         steps += [('native-flow', ['./scripts/test-native-flow.sh']), ('native-auth', ['./scripts/test-native-auth.sh']),
                   ('native-security', ['./scripts/test-native-security.sh']),
                   ('device-storage', [sys.executable, 'scripts/verify-device-storage.py'])]
-        for scenario in ['smoke', 'auth-negative', 'credentials', 'keyboard-tools', 'reconnect']:
+        for scenario in ['smoke', 'auth-negative', 'credentials', 'keyboard-tools', 'ime-lifecycle', 'ime-reset-probe', 'reconnect']:
             steps += [('ui-' + scenario, ['env', 'HT_UI_SCENARIO=' + scenario, './scripts/test-ui.sh'])]
     if mode in ['compat', 'all']:
         steps += [('openssh-compat', ['./scripts/test-openssh.sh'])]

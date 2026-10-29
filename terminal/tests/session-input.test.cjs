@@ -133,3 +133,40 @@ test('UTF-8 paste validation preserves BOM, NUL and multibyte characters byte fo
     assert.equal(Buffer.concat(f.writes.map(value => Buffer.from(value.data, 'base64'))).toString(), '\x1b[200~' + text + '\x1b[201~');
   } finally { f.session.dispose(); }
 });
+
+test('changing IME during a pending input reset supersedes its request and eventually resumes input', () => {
+  for (const enabled of [false, true]) {
+    const f = fixture();
+    try {
+      f.session.stopPaste(false);
+      const oldReset = f.resets.at(-1);
+      assert.equal(f.snapshot.inputEnabled, false);
+      f.session.setImeMode(enabled);
+      assert.equal(f.resets.length, 2, 'the new input epoch needs a matching native reset');
+      const currentReset = f.resets.at(-1);
+      assert.ok(currentReset[2] > oldReset[2]);
+      f.emit({ type: 'inputReset', inputEpoch: oldReset[2] });
+      assert.equal(f.snapshot.inputEnabled, false);
+      f.emit({ type: 'inputReset', inputEpoch: currentReset[2] });
+      assert.equal(f.snapshot.inputEnabled, true);
+      assert.equal(f.web.textarea.readOnly, !enabled);
+      f.session.routeKey({ kind: 'key', id: 'Enter' });
+      assert.equal(Buffer.from(f.writes.at(-1).data, 'base64').toString(), '\r');
+    } finally { f.session.dispose(); }
+  }
+});
+
+test('a healthy IME transition resets the old native input epoch before accepting new keys', () => {
+  const f = fixture();
+  try {
+    const oldEpoch = f.session.input.getInputEpoch();
+    f.session.setImeMode(true);
+    assert.equal(f.resets.length, 1);
+    const currentEpoch = f.resets[0][2];
+    assert.ok(currentEpoch > oldEpoch); assert.equal(f.snapshot.inputEnabled, false);
+    f.session.routeKey({ kind: 'key', id: 'Enter' }); assert.equal(f.writes.length, 0);
+    f.emit({ type: 'inputReset', inputEpoch: currentEpoch });
+    f.session.routeKey({ kind: 'key', id: 'Enter' });
+    assert.equal(f.writes.length, 1); assert.equal(f.writes[0].inputEpoch, currentEpoch);
+  } finally { f.session.dispose(); }
+});

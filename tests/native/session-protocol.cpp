@@ -20,6 +20,7 @@ struct Sink final : NativeEventSink {
     std::string body = "你后续不应发送";
     bool cancelStart = false;
     bool cancelEnd = false;
+    bool supersedeReset = false;
     size_t bodyConsumed = 0;
     bool Emit(std::unique_ptr<NativeEvent> event) override {
         if (event->type == NativeEventType::HostKey) { session->TrustDecision(true); return true; }
@@ -43,7 +44,8 @@ struct Sink final : NativeEventSink {
                     session->WriteInput(1, "end", {27, '[', '2', '0', '1', '~'}, InputKind::PasteEnd, "paste");
                 }
             } else {
-                session->ResetInput(2, true);
+                session->ResetInput(2, !supersedeReset);
+                if (supersedeReset) session->ResetInput(3, true);
                 session->ResetInput(2, true); // Duplicate cancellation must not duplicate Ctrl+C.
                 session->ResetInput(1, true); // Stale input epoch must not block future input.
             }
@@ -52,8 +54,9 @@ struct Sink final : NativeEventSink {
             session->ResetInput(2, true);
         }
         if (event->type == NativeEventType::InputReset) {
-            reset = event->inputEpoch == 2;
-            session->WriteInput(2, "after-reset", {'Z'});
+            const uint64_t expectedEpoch = supersedeReset ? 3 : 2;
+            reset = event->inputEpoch == expectedEpoch;
+            session->WriteInput(expectedEpoch, "after-reset", {'Z'});
         }
         if (event->type == NativeEventType::Probe) {
             probe = event->requestId == 42;
@@ -77,6 +80,7 @@ bool Run(const char *dir, const char *host, uint32_t port, const std::string &us
     sink.paste = paste;
     sink.cancelStart = boundary == 1;
     sink.cancelEnd = boundary == 2;
+    sink.supersedeReset = boundary == 4;
     if (boundary == 3) sink.body = "🙂后续不应发送";
     auto options = std::make_unique<NativeConnectOptions>();
     options->sessionId = "protocol"; options->connectionEpoch = 1; options->terminalGeneration = 1;
@@ -113,5 +117,6 @@ int main(int argc, char **argv) {
     bool e = Run(argv[1], argv[2], port, "review", true, 1);
     bool f = Run(argv[1], argv[2], port, "review", true, 2);
     bool g = Run(argv[1], argv[2], port, "review", true, 3);
-    return a && b && c && d && e && f && g ? 0 : 1;
+    bool h = Run(argv[1], argv[2], port, "review", true, 4);
+    return a && b && c && d && e && f && g && h ? 0 : 1;
 }

@@ -322,6 +322,24 @@ def main():
     if os.environ.get('HT_UI_SCENARIO') == 'credentials':
         credentials_flow()
         return
+    if os.environ.get('HT_UI_SCENARIO') == 'ime-reset-probe':
+        connect(username='probe-delay')
+        for toggle in ['中文', '终端']:
+            call('shell', 'uitest', 'uiInput', 'keyEvent', 'Home')
+            time.sleep(.3)
+            call('shell', 'aa', 'start', '-a', 'EntryAbility', '-b', 'com.nickitclaw.hterminal')
+            entries = wait(lambda e: find(e, '检查连接'))
+            click(find(entries, toggle, 'Button'))
+            wait(lambda e: find(e, 'OPEN') and not find(e, '检查连接'))
+            time.sleep(.3)
+            if toggle == '中文':
+                wait(lambda e: find(e, '英文', 'Button'))
+                ime_text('ime-after-delayed-probe')
+            else:
+                click(by_id(layout(), 'terminal-tools-close'))
+                press('Q', 'q', b'q')
+        print('PASS: IME and terminal tools recover input when toggled during delayed native probe/reset', flush=True)
+        return
     if os.environ.get('HT_UI_SCENARIO') == 'ime-lifecycle':
         connect()
         click(find(layout(), '中文', 'Button'))

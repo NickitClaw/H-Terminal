@@ -12,7 +12,7 @@ new Server({ hostKeys: [privateKey] }, (client) => {
   client.on('error', () => {});
   client.on('authentication', (request) => {
     username = request.username;
-    if (request.method === 'password' && ['review', 'soak', 'probe-reject', 'probe-timeout'].includes(username) &&
+    if (request.method === 'password' && ['review', 'soak', 'probe-reject', 'probe-timeout', 'probe-delay'].includes(username) &&
       request.password === 'review') request.accept();
     else request.reject(['password']);
   });
@@ -24,12 +24,19 @@ new Server({ hostKeys: [privateKey] }, (client) => {
       // ssh2's public accept/reject callbacks intentionally ignore env after
       // shell startup. Emit the protocol response directly in this pinned
       // fixture to model SSH servers that accept/reject a post-shell probe.
-      if (session._channel) {
-        const remote = session._channel.outgoing.id;
-        if (username === 'probe-reject') client._protocol.channelFailure(remote);
-        else if (username !== 'probe-timeout') client._protocol.channelSuccess(remote);
-      } else if (username === 'probe-reject') reject?.();
-      else if (username !== 'probe-timeout') accept?.();
+      const reply = () => {
+        if (session._channel) {
+          const remote = session._channel.outgoing.id;
+          if (username === 'probe-reject') client._protocol.channelFailure(remote);
+          else if (username !== 'probe-timeout') client._protocol.channelSuccess(remote);
+        } else if (username === 'probe-reject') reject?.();
+        else if (username !== 'probe-timeout') accept?.();
+      };
+      if (username === 'probe-delay') {
+        const cancel = () => clearTimeout(timer);
+        const timer = setTimeout(() => { client.off('close', cancel); reply(); }, 3000);
+        client.once('close', cancel);
+      } else reply();
     });
     session.on('shell', (accept) => {
       const stream = accept();
