@@ -68,8 +68,10 @@ export async function verifyDeviceStorage(context: common.Context): Promise<void
     rejected = false;
     try { const unsafe = await tampered.read(id); unsafe.fill(0); } catch (_error) { rejected = true; }
     if (!rejected) throw new Error('tampered metadata accepted');
-    phase = 'credential deletion';
+    phase = 'credential deletion after key loss';
+    await cipher.remove(id);
     await vault.remove(id);
+    await cipher.remove(id);
     id = '';
     const empty = new CredentialVault(store, cipher);
     await empty.load();

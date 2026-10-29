@@ -12,7 +12,7 @@ const ByteCodec = {
   byteLength: (text) => Buffer.byteLength(text)
 };
 
-function createEtsLoader({ native = {}, display = {} } = {}) {
+function createEtsLoader({ native = {}, display = {}, kits = {} } = {}) {
   const cache = new Map();
   const load = (relative) => {
     const filename = path.resolve(projectRoot, relative);
@@ -25,6 +25,7 @@ function createEtsLoader({ native = {}, display = {} } = {}) {
     }).outputText;
     const requireEts = (specifier) => {
       if (specifier === 'libentry.so') return { default: native, ...native };
+      if (Object.hasOwn(kits, specifier)) return kits[specifier];
       if (specifier === '@kit.ArkUI') return { display };
       if (specifier.startsWith('@kit.')) return {};
       return load(path.resolve(path.dirname(filename), `${specifier}.ets`));

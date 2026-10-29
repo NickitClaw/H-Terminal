@@ -38,7 +38,14 @@ export class HuksCredentialCipher implements CredentialCipher {
     return this.operate(id, ByteCodec.decodeBytes(sealed.ciphertext), ByteCodec.decodeBytes(sealed.nonce), aad, false);
   }
 
-  async remove(id: string): Promise<void> { await huks.deleteKeyItem(this.alias(id), { properties: [] }); }
+  async remove(id: string): Promise<void> {
+    try { await huks.deleteKeyItem(this.alias(id), { properties: [] }); }
+    catch (error) {
+      // HUKS reports a missing entity as an error, including after a prior
+      // deletion or device-key loss. The requested cleanup is already done.
+      if ((error as BusinessError).code !== 12000011) throw error as Error;
+    }
+  }
 
   private async operate(id: string, data: Uint8Array, nonce: Uint8Array, aad: string, encrypt: boolean): Promise<Uint8Array> {
     if (nonce.length !== 12 || (!encrypt && data.length < 16)) throw new Error('凭据密文无效');

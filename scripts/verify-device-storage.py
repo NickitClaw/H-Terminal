@@ -65,7 +65,7 @@ try:
             break
         time.sleep(.5)
     assert passed, 'device probe did not complete'
-    print('PASS: actual NAPI key inspection, encrypted Ed25519 passphrase, HUKS AES-GCM, restart and tamper rejection')
+    print('PASS: actual NAPI key inspection, encrypted Ed25519 passphrase, HUKS AES-GCM, restart, tamper rejection and deletion after key loss')
 finally:
     ability.write_bytes(original)
     if probe.exists():
